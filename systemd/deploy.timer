@@ -1,0 +1,22 @@
+# A .timer unit is the systemd equivalent of a cron job.
+# It triggers the service with the same name (deploy.service) on a schedule.
+
+[Unit]
+Description=Run deploy every 15 minutes
+
+[Timer]
+# Wait 2 minutes after boot before the first run,
+# so the system and network are fully ready.
+OnBootSec=2min
+
+# After each run, wait 15 minutes before triggering again.
+OnUnitActiveSec=15min
+
+# If the system was off when a run was due, execute it immediately on next boot
+# (catch-up behavior, similar to anacron).
+Persistent=true
+
+[Install]
+# Register this timer so it starts automatically at boot
+# when enabled with: systemctl enable deploy.timer
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+# A .service unit describes how to run a program.
+# This one is triggered by deploy.timer — it is not meant to be started manually.
+
+[Unit]
+Description=Pull and deploy home-automation
+
+# Only run after the network is fully up, because the deploy script
+# likely pulls code from a remote server (e.g. git pull).
+After=network-online.target
+
+[Service]
+# oneshot means: run the command once and exit.
+# systemd considers the service "done" as soon as the script finishes.
+Type=oneshot
+
+# The script to execute. It should handle pulling the latest code
+# and restarting any services that need updating.
+ExecStart=/home/pi/home-automation/deploy/deploy.sh
+
+# Run as the unprivileged "pi" user instead of root, for security.
+User=pi
