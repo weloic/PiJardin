@@ -1,0 +1,21 @@
+# A .timer unit is the systemd equivalent of a cron job.
+# It triggers sensors.service on a precise clock-aligned schedule.
+
+[Unit]
+Description=Read sensor data every 5 minutes, on the clock (00, 05, 10, ...)
+
+[Timer]
+# Fire at :00, :05, :10, ... of every hour, every day.
+# Unlike OnUnitActiveSec, this is clock-aligned, not relative to last run.
+OnCalendar=*:0/5
+
+# Reduce the default 1-minute jitter to ~1 second so the run starts on time.
+AccuracySec=1s
+
+# If the system was off when a run was due, execute it immediately on next boot.
+Persistent=False
+
+[Install]
+# Register this timer so it starts automatically at boot
+# when enabled with: systemctl enable sensors.timer
+WantedBy=timers.target
