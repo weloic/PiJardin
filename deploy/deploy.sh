@@ -22,10 +22,10 @@ if git diff --name-only "$OLD" "$NEW" | grep -q "deploy/requirements.txt"; then
     /home/pi/venv/bin/pip install -r deploy/requirements.txt
 fi
 
-# Sync systemd unit files if they changed
-if git diff --name-only "$OLD" "$NEW" | grep -q "^systemd/"; then
-    sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
-    sudo systemctl daemon-reload
+# Re-bootstrap if systemd units or the bootstrap script itself changed.
+# bootstrap.sh handles copy + daemon-reload + enable, so no duplication here.
+if git diff --name-only "$OLD" "$NEW" | grep -qE "^systemd/|^deploy/bootstrap\.sh"; then
+    bash "$REPO_DIR/deploy/bootstrap.sh"
 fi
 
 # Restart your sensor service
