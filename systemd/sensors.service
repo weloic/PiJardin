@@ -1,5 +1,6 @@
 # A .service unit describes how to run a program.
 # This one is triggered by sensors.timer — it is not meant to be started manually.
+# NOTE: @@PLACEHOLDER@@ tokens are substituted by deploy/bootstrap.sh at install time.
 
 [Unit]
 Description=Read and record sensor data
@@ -9,8 +10,11 @@ Description=Read and record sensor data
 # systemd considers the service "done" as soon as the script finishes.
 Type=oneshot
 
-# The Python script to execute.
-ExecStart=/usr/bin/python3 /home/pi/PiJardin/sensors.py     # TODO: update
+# Inject all variables from .env (including secrets) into the process environment.
+EnvironmentFile=@@REPO_DIR@@/.env
 
-# Run as the unprivileged "pi" user instead of root, for security.
-User=pi
+# The Python script to execute.
+ExecStart=@@PYTHON_BIN@@ @@REPO_DIR@@/sensors.py
+
+# Run as the unprivileged user instead of root, for security.
+User=@@SERVICE_USER@@
