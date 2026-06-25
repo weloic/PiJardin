@@ -14,7 +14,7 @@ Type=oneshot
 EnvironmentFile=@@REPO_DIR@@/.env
 
 # The Python script to execute.
-ExecStart=@@PYTHON_BIN@@ @@REPO_DIR@@/sensors.py
+ExecStart=@@PYTHON_BIN@@ @@REPO_DIR@@/sensors/read_puit.py
 
 # Run as the unprivileged user instead of root, for security.
 User=@@SERVICE_USER@@
