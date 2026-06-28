@@ -117,13 +117,15 @@ def roundTime(dt=None, roundTo=60):
 # -------------------------------------------------------------------------------------------------
 # INITIALISATION
 print("Waiting for Arduino to start serial communication...")
-while True:
+deadline = time.time() + 10
+while time.time() < deadline:
     line = arduino.readline().decode('utf-8', errors='ignore').strip()
     if line:
         print(f"Arduino says: {line}")
     if line == "Started serial com":
         break
     time.sleep(0.1)
+print("Proceeding (ready or timeout).")
 
 previous_measure = None
 
