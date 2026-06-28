@@ -126,6 +126,7 @@ while time.time() < deadline:
         break
     time.sleep(0.1)
 print("Proceeding (ready or timeout).")
+arduino.reset_input_buffer()
 
 previous_measure = None
 
