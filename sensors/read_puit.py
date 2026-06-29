@@ -14,10 +14,10 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # CONFIGURATION
 
 ## Influx database
-INFLUXDB_URL = "http://localhost:8086"
-INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN")  # Fetch token from environment variable
-INFLUXDB_ORG = "PiJardin"
-INFLUXDB_BUCKET = "puit"
+INFLUXDB_URL    = os.getenv("INFLUX_URL",    "http://localhost:8086")
+INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN")
+INFLUXDB_ORG    = os.getenv("INFLUX_ORG",    "PiJardin")
+INFLUXDB_BUCKET = os.getenv("INFLUX_BUCKET", "puit")
 
 client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
 write_api = client.write_api(write_options=SYNCHRONOUS)
