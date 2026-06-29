@@ -30,13 +30,15 @@ if git diff --name-only "$OLD" "$NEW" | grep -qE "^systemd/|^deploy/bootstrap\.s
     bash "$REPO_DIR/deploy/bootstrap.sh"
 fi
 
-# Reinstall Grafana provisioning config if it changed (dashboard JSONs are hot-reloaded by Grafana).
-if git diff --name-only "$OLD" "$NEW" | grep -q "^grafana/provisioning/"; then
+# Sync Grafana dashboards and provisioning config if either changed.
+if git diff --name-only "$OLD" "$NEW" | grep -q "^grafana/"; then
     GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"
+    GRAFANA_DASH_DIR="/var/lib/grafana/dashboards"
     if [ -d "$GRAFANA_PROV_DIR" ]; then
-        sed "s|@@REPO_DIR@@|$REPO_DIR|g" \
-            "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" \
-            | sudo tee "$GRAFANA_PROV_DIR/pijardin.yaml" > /dev/null
+        sudo cp "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" "$GRAFANA_PROV_DIR/pijardin.yaml"
+        sudo mkdir -p "$GRAFANA_DASH_DIR"
+        sudo cp "$REPO_DIR"/grafana/dashboards/*.json "$GRAFANA_DASH_DIR/"
+        sudo chown -R grafana:grafana "$GRAFANA_DASH_DIR"
         sudo systemctl restart grafana-server
     fi
 fi

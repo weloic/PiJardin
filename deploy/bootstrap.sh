@@ -30,12 +30,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now deploy.timer
 sudo systemctl enable --now sensors.timer
 
-# Install Grafana provisioning config (replaces @@REPO_DIR@@ with the actual path)
+# Install Grafana provisioning config and seed dashboards
 GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"
+GRAFANA_DASH_DIR="/var/lib/grafana/dashboards"
 if [ -d "$GRAFANA_PROV_DIR" ]; then
-    sed "s|@@REPO_DIR@@|$REPO_DIR|g" \
-        "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" \
-        | sudo tee "$GRAFANA_PROV_DIR/pijardin.yaml" > /dev/null
+    sudo cp "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" "$GRAFANA_PROV_DIR/pijardin.yaml"
+    sudo mkdir -p "$GRAFANA_DASH_DIR"
+    sudo cp "$REPO_DIR"/grafana/dashboards/*.json "$GRAFANA_DASH_DIR/" 2>/dev/null || true
+    sudo chown -R grafana:grafana "$GRAFANA_DASH_DIR"
     sudo systemctl restart grafana-server
 fi
 
