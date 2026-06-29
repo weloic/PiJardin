@@ -64,8 +64,8 @@ def write_influx_log(log, tag=None):
     write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
 def write_influx_measurement(heigth_median, resampled=False):
-    # Determine the nearest 10 minute
-    rounded = roundTime(roundTo=600)
+    # Determine the nearest 5 minute
+    rounded = roundTime(roundTo=300)
 
     print('Write influxdb time', rounded.hour, rounded.minute)
     # Create a data point for InfluxDB
