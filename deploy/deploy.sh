@@ -30,6 +30,17 @@ if git diff --name-only "$OLD" "$NEW" | grep -qE "^systemd/|^deploy/bootstrap\.s
     bash "$REPO_DIR/deploy/bootstrap.sh"
 fi
 
+# Reinstall Grafana provisioning config if it changed (dashboard JSONs are hot-reloaded by Grafana).
+if git diff --name-only "$OLD" "$NEW" | grep -q "^grafana/provisioning/"; then
+    GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"
+    if [ -d "$GRAFANA_PROV_DIR" ]; then
+        sed "s|@@REPO_DIR@@|$REPO_DIR|g" \
+            "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" \
+            | sudo tee "$GRAFANA_PROV_DIR/pijardin.yaml" > /dev/null
+        sudo systemctl restart grafana-server
+    fi
+fi
+
 # Restart the sensor service
 sudo systemctl restart sensors.service
 
