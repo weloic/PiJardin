@@ -243,6 +243,7 @@
         "y": 8
       },
       "id": 4,
+      "timeFrom": "3d",
       "options": {
         "legend": {
           "calcs": [],
@@ -281,5 +282,5 @@
   "timezone": "browser",
   "title": "PiJardin",
   "uid": "1c60ae51-1537-405d-bb72-3aff8fd76b72",
-  "version": 11
+  "version": 12
 }
