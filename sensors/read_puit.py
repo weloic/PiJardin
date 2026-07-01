@@ -5,6 +5,8 @@ import time
 import datetime
 import serial
 import os
+import sys
+import json
 from numpy import median
 
 from influxdb_client import InfluxDBClient, Point
@@ -19,13 +21,24 @@ INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN")
 INFLUXDB_ORG    = os.getenv("INFLUX_ORG",    "PiJardin")
 INFLUXDB_BUCKET = os.getenv("INFLUX_BUCKET", "puit")
 
-client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
-write_api = client.write_api(write_options=SYNCHRONOUS)
+try:
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+except Exception as e:
+    print(f"❌ Could not initialize InfluxDB client: {e}")
+    sys.exit(1)
 
 ## Serial communication
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 9600
-arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=.1)
+try:
+    arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=.1)
+except Exception as e:
+    print(f"❌ Could not open serial port {SERIAL_PORT}: {e}")
+    sys.exit(1)
+
+## Store last measurements
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.puit_state.json')
 
 # -------------------------------------------------------------------------------------------------
 # FUNCTIONS
@@ -50,13 +63,32 @@ def get_sensor_data(retries=3, delay=0.5):
     write_influx_log(('arduino', 'no response'))
     return None
 
+def load_previous_measure():
+    try:
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+        value = data.get('previous_measure')
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+    except Exception as e:
+        print(f"Warning: could not load previous measure ({e}); treating as unknown.")
+        return None
+
+def save_previous_measure(height):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({'previous_measure': height}, f)
+    except Exception as e:
+        print(f"Warning: could not save previous measure ({e}).")
+
 def write_influx_log(log, tag=None):
     (field_name, field_value) = log
     point = (
         Point('log')
         .field(field_name, field_value)
     )
-    if tag != None:
+    if tag is not None:
         (tag_name, tag_value) = tag
         point.tag(tag_name, tag_value)
 
@@ -77,30 +109,37 @@ def write_influx_measurement(heigth_median, resampled=False):
         .field('lenght_median', heigth_median)
     )
 
-    if rounded.hour==0 and rounded.minute==0: 
-        point.tag('midnight', 'midnight', resampled)
+    if rounded.hour==0 and rounded.minute==0:
+        point.tag('midnight', 'midnight')
 
     # Write data to InfluxDB
     write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
 
 def collect_puit_data():
-    global previous_measure
     max_diff_tolerance = 5 # cm
     resampled = False
 
+    previous_measure = load_previous_measure()
     height = get_sensor_data()
-    
-    if previous_measure:
+
+    if height is None:
+        print("No valid height reading this run; skipping write.")
+        return False
+
+    if previous_measure is not None:
         if abs(height-previous_measure) > max_diff_tolerance:
             height_medians = [height]
             for i in range(4):
-                height_medians.append(get_sensor_data())
-            height = median(height_medians)
+                sample = get_sensor_data()
+                if sample is not None:
+                    height_medians.append(sample)
+            height = float(median(height_medians))
             resampled = True
-    
+
     write_influx_measurement(height, resampled)
-    previous_measure = height
+    save_previous_measure(height)
+    return True
 
 
 def roundTime(dt=None, roundTo=60):
@@ -128,9 +167,9 @@ while time.time() < deadline:
 print("Proceeding (ready or timeout).")
 arduino.reset_input_buffer()
 
-previous_measure = None
-
 # -------------------------------------------------------------------------------------------------
 # SCHEDULING
 
-collect_puit_data()
+success = collect_puit_data()
+if not success:
+    sys.exit(1)
