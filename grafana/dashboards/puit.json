@@ -100,8 +100,6 @@
             "axisColorMode": "series",
             "axisLabel": "",
             "axisPlacement": "auto",
-            "axisSoftMax": 8,
-            "axisSoftMin": 0,
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
@@ -146,7 +144,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 12,
         "w": 12,
         "x": 12,
         "y": 0
@@ -175,6 +173,120 @@
       ],
       "title": "Historique 24h",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "derxjdbeh5hc0f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "continuous-RdYlGr"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "max": 1000,
+          "min": -1000,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "litre"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 8
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "12.0.2",
+      "targets": [
+        {
+          "query": "import \"array\"\r\n\r\ndata = from(bucket: \"puit\")\r\n  |> range(start: -3h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirst = data |> limit(n: 3) |> mean()\r\nlast = data |> tail(n: 3) |> mean()\r\n\r\nfirstVal = findRecord(tables: first, fn: (key) => true, idx: 0)._value\r\nlastVal = findRecord(tables: last, fn: (key) => true, idx: 0)._value\r\n\r\narray.from(rows: [{_time: now(), _value: lastVal - firstVal}])",
+          "refId": "A"
+        }
+      ],
+      "title": "Variation eau - 3 dernières heures",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "derxjdbeh5hc0f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "continuous-RdYlGr"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "max": 1000,
+          "min": -1000,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "litre"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 8
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "12.0.2",
+      "targets": [
+        {
+          "query": "import \"array\"\r\n\r\ndata = from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirst = data |> limit(n: 6) |> mean()\r\nlast = data |> tail(n: 6) |> mean()\r\n\r\nfirstVal = findRecord(tables: first, fn: (key) => true, idx: 0)._value\r\nlastVal = findRecord(tables: last, fn: (key) => true, idx: 0)._value\r\n\r\narray.from(rows: [{_time: now(), _value: lastVal - firstVal}])",
+          "refId": "A"
+        }
+      ],
+      "title": "Variation eau - 24 dernières heures",
+      "type": "stat"
     },
     {
       "datasource": {
@@ -241,7 +353,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 12
       },
       "id": 4,
       "timeFrom": "3d",
@@ -333,7 +445,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 12
       },
       "id": 3,
       "options": {
@@ -374,5 +486,5 @@
   "timezone": "browser",
   "title": "PiJardin",
   "uid": "1c60ae51-1537-405d-bb72-3aff8fd76b72",
-  "version": 12
+  "version": 13
 }
