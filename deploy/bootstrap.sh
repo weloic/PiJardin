@@ -29,6 +29,7 @@ sudo systemctl daemon-reload
 
 sudo systemctl enable --now deploy.timer
 sudo systemctl enable --now sensors.timer
+sudo systemctl enable --now telegram-bot.service
 
 # Install Grafana provisioning config and seed dashboards
 GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"

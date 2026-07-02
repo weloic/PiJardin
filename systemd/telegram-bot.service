@@ -1,0 +1,29 @@
+# A .service unit describes how to run a program.
+# This one is a persistent process (unlike sensors.service which is oneshot).
+# NOTE: @@PLACEHOLDER@@ tokens are substituted by deploy/bootstrap.sh at install time.
+
+[Unit]
+Description=Telegram bot for PiJardin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# simple means: the process is the bot itself; systemd tracks it as long as it runs.
+Type=simple
+
+# Inject all variables from .env (including secrets) into the process environment.
+EnvironmentFile=@@REPO_DIR@@/.env
+
+# The Python script to execute.
+ExecStart=@@VENV_DIR@@/bin/python3 @@REPO_DIR@@/sensors/telegram_bot.py
+
+# Run as the unprivileged user instead of root, for security.
+User=@@SERVICE_USER@@
+
+# Restart only on failure (non-zero exit). The stub exits 0 when token is missing,
+# so it will NOT restart in that case — the service just stays inactive (dead).
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

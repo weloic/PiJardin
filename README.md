@@ -21,3 +21,9 @@ And visualize output using:
 ```
 journalctl -u sensors.service -n 30
 ```
+
+## Telegram bot deploy
+Once .env is set, run following to deploy:
+```
+sudo systemctl restart telegram-bot.service
+```
