@@ -26,6 +26,7 @@ PASSWORD_TO_ROLE = {
 }
 
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.telegram_users.json')
+MAX_FAILED_ATTEMPTS = 10
 
 # -------------------------------------------------------------------------------------------------
 # STARTUP CHECK
@@ -68,18 +69,36 @@ def save_users(users):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
 
+    users = load_users()
+    previous = users.get(chat_id, {})
+
+    if previous.get("banned"):
+        log.info(f"Ignored /start from banned chat {chat_id}.")
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /start <password>")
         return
 
     role = PASSWORD_TO_ROLE.get(context.args[0])
     if role is None:
-        log.info(f"Rejected registration attempt from chat {chat_id}: invalid password.")
+        fails = previous.get("fails", 0) + 1
+        if fails >= MAX_FAILED_ATTEMPTS:
+            previous["fails"] = fails
+            previous["banned"] = True
+            users[chat_id] = previous
+            save_users(users)
+            log.warning(f"Banned chat {chat_id} after {fails} failed password attempts.")
+            await update.message.reply_text("Too many failed attempts. You have been blocked.")
+            return
+
+        previous["fails"] = fails
+        users[chat_id] = previous
+        save_users(users)
+        log.info(f"Rejected registration attempt from chat {chat_id}: invalid password ({fails}/{MAX_FAILED_ATTEMPTS}).")
         await update.message.reply_text("Invalid password.")
         return
 
-    users = load_users()
-    previous = users.get(chat_id, {})
     users[chat_id] = {
         "role": role,
         "username": update.effective_user.username or update.effective_user.first_name,
