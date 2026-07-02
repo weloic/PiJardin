@@ -27,3 +27,11 @@ Once .env is set, run following to deploy:
 ```
 sudo systemctl restart telegram-bot.service
 ```
+
+Users register themselves by messaging the bot `/start <password>`. The password determines their role:
+- `TELEGRAM_PASSWORD_ADMIN` in `.env` — registers as `admin`
+- `TELEGRAM_PASSWORD_VIEWER` in `.env` — registers as `viewer`
+
+Registered chat IDs and roles are stored in `sensors/.telegram_users.json` (gitignored, not committed).
+
+Alert delivery is independent of role and off by default. Once registered, a user toggles it with `/alerts on` or `/alerts off` (or `/alerts` with no argument to check the current setting).
