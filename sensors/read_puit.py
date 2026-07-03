@@ -9,7 +9,7 @@ import sys
 import json
 from numpy import median
 
-from influxdb_client import InfluxDBClient, Point
+from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # -------------------------------------------------------------------------------------------------
@@ -96,21 +96,18 @@ def write_influx_log(log, tag=None):
     write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
 
 def write_influx_measurement(heigth_median, resampled=False):
-    # Determine the nearest 5 minute
-    rounded = roundTime(roundTo=300)
+    # Timestamp rounded to the nearest 5 minutes; must be UTC-aware because the
+    # client interprets naive datetimes as UTC
+    rounded = roundTime(datetime.datetime.now(datetime.timezone.utc), roundTo=300)
 
-    print('Write influxdb time', rounded.hour, rounded.minute)
+    print('Write influxdb time', rounded.isoformat())
     # Create a data point for InfluxDB
     point = (
         Point('height_measure')  # Measurement name
-        .tag('hour', rounded.hour)
-        .tag('minute', rounded.minute)
         .tag('resampled', resampled)
         .field('lenght_median', heigth_median)
+        .time(rounded, WritePrecision.S)
     )
-
-    if rounded.hour==0 and rounded.minute==0:
-        point.tag('midnight', 'midnight')
 
     # Write data to InfluxDB
     write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)

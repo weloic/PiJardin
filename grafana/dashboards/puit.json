@@ -167,7 +167,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> drop(columns: [\"hour\", \"minute\", \"resampled\", \"midnight\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
@@ -373,7 +373,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: -3d)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> drop(columns: [\"hour\", \"minute\", \"resampled\", \"midnight\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: -3d)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
@@ -464,7 +464,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: -1w)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> drop(columns: [\"hour\", \"minute\", \"resampled\", \"midnight\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: -1w)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
