@@ -33,10 +33,21 @@ sudo systemctl enable --now telegram-bot.service
 
 # Install Grafana provisioning config and seed dashboards
 GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"
+GRAFANA_DS_DIR="/etc/grafana/provisioning/datasources"
 GRAFANA_DASH_DIR="/var/lib/grafana/dashboards"
 if [ -d "$GRAFANA_PROV_DIR" ]; then
+    # Datasource provisioning: inject the InfluxDB token from .env into the
+    # committed template ('|' as sed delimiter: base64 tokens may contain '/')
+    sudo mkdir -p "$GRAFANA_DS_DIR"
+    sed "s|__INFLUXDB_TOKEN__|$INFLUXDB_TOKEN|" \
+        "$REPO_DIR/grafana/provisioning/datasources/influxdb.yaml" \
+        | sudo tee "$GRAFANA_DS_DIR/influxdb.yaml" > /dev/null
+    sudo chown root:grafana "$GRAFANA_DS_DIR/influxdb.yaml"
+    sudo chmod 640 "$GRAFANA_DS_DIR/influxdb.yaml"
+
     sudo cp "$REPO_DIR/grafana/provisioning/dashboards/pijardin.yaml" "$GRAFANA_PROV_DIR/pijardin.yaml"
     sudo mkdir -p "$GRAFANA_DASH_DIR"
+
     sudo cp "$REPO_DIR"/grafana/dashboards/*.json "$GRAFANA_DASH_DIR/" 2>/dev/null || true
     sudo chown -R grafana:grafana "$GRAFANA_DASH_DIR"
     sudo systemctl restart grafana-server

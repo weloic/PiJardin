@@ -18,13 +18,13 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 1,
+  "id": null,
   "links": [],
   "panels": [
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -41,10 +41,6 @@
             "steps": [
               {
                 "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
               }
             ]
           },
@@ -77,7 +73,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n  |> last()",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n  |> last()",
           "refId": "A"
         }
       ],
@@ -87,7 +83,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -134,7 +130,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n  |> last()\r\n  |> map(fn: (r) => ({ r with _value: float(v: uint(v: r._time)) / 1000000.0 }))",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n  |> last()\r\n  |> map(fn: (r) => ({ r with _value: float(v: uint(v: r._time)) / 1000000.0 }))",
           "refId": "A"
         }
       ],
@@ -144,7 +140,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -184,19 +180,17 @@
               "mode": "off"
             }
           },
+          "displayName": "Volume",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
               }
             ]
-          }
+          },
+          "unit": "m3"
         },
         "overrides": []
       },
@@ -213,7 +207,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "hideZeros": false,
@@ -224,7 +218,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
@@ -234,7 +228,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -281,7 +275,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "import \"array\"\r\n\r\ndata = from(bucket: \"puit\")\r\n  |> range(start: -3h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirst = data |> limit(n: 3) |> mean()\r\nlast = data |> tail(n: 3) |> mean()\r\n\r\nfirstVal = findRecord(tables: first, fn: (key) => true, idx: 0)._value\r\nlastVal = findRecord(tables: last, fn: (key) => true, idx: 0)._value\r\n\r\narray.from(rows: [{_time: now(), _value: lastVal - firstVal}])",
+          "query": "data = from(bucket: \"puit\")\r\n  |> range(start: -3h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirstAvg = data |> limit(n: 3) |> mean() |> set(key: \"k\", value: \"first\")\r\nlastAvg = data |> tail(n: 3) |> mean() |> set(key: \"k\", value: \"last\")\r\n\r\nunion(tables: [firstAvg, lastAvg])\r\n  |> pivot(rowKey: [], columnKey: [\"k\"], valueColumn: \"_value\")\r\n  |> map(fn: (r) => ({ _time: now(), _value: r.last - r.first }))",
           "refId": "A"
         }
       ],
@@ -291,7 +285,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -338,7 +332,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "import \"array\"\r\n\r\ndata = from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> group()\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirst = data |> limit(n: 6) |> mean()\r\nlast = data |> tail(n: 6) |> mean()\r\n\r\nfirstVal = findRecord(tables: first, fn: (key) => true, idx: 0)._value\r\nlastVal = findRecord(tables: last, fn: (key) => true, idx: 0)._value\r\n\r\narray.from(rows: [{_time: now(), _value: lastVal - firstVal}])",
+          "query": "data = from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirstAvg = data |> limit(n: 6) |> mean() |> set(key: \"k\", value: \"first\")\r\nlastAvg = data |> tail(n: 6) |> mean() |> set(key: \"k\", value: \"last\")\r\n\r\nunion(tables: [firstAvg, lastAvg])\r\n  |> pivot(rowKey: [], columnKey: [\"k\"], valueColumn: \"_value\")\r\n  |> map(fn: (r) => ({ _time: now(), _value: r.last - r.first }))",
           "refId": "A"
         }
       ],
@@ -348,7 +342,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -390,19 +384,17 @@
               "mode": "off"
             }
           },
+          "displayName": "Volume",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
               }
             ]
-          }
+          },
+          "unit": "m3"
         },
         "overrides": []
       },
@@ -419,7 +411,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "hideZeros": false,
@@ -430,7 +422,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
@@ -440,7 +432,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "derxjdbeh5hc0f"
+        "uid": "influxdb-pijardin"
       },
       "fieldConfig": {
         "defaults": {
@@ -482,19 +474,17 @@
               "mode": "off"
             }
           },
+          "displayName": "Volume",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
               }
             ]
-          }
+          },
+          "unit": "m3"
         },
         "overrides": []
       },
@@ -511,7 +501,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "hideZeros": false,
@@ -522,7 +512,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
+          "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
         }
       ],
@@ -531,6 +521,7 @@
     }
   ],
   "preload": true,
+  "refresh": "5m",
   "schemaVersion": 41,
   "tags": [],
   "templating": {
