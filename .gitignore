@@ -1,6 +1,7 @@
 .env
 sensors/.puit_state.json
 sensors/.puit.lock
-sensors/.telegram_users.json
+telegram_bot/.telegram_users.json
+telegram_bot/.alert_state.json
 __pycache__/
 *.pyc

@@ -57,8 +57,8 @@ fi
 # Restart the sensor service
 sudo systemctl restart sensors.service
 
-# Restart the bot if its script changed (token picked up from .env automatically)
-if git diff --name-only "$OLD" "$NEW" | grep -q "^sensors/telegram_bot\.py"; then
+# Restart the bot if anything in its folder changed (token picked up from .env automatically)
+if git diff --name-only "$OLD" "$NEW" | grep -q "^telegram_bot/"; then
     sudo systemctl restart telegram-bot.service
 fi
 

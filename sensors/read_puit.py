@@ -12,6 +12,10 @@ from numpy import median
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+## alerts.py lives in telegram_bot/; when run as a script, only sensors/ is on sys.path.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'telegram_bot'))
+import alerts
+
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
 
@@ -180,6 +184,13 @@ def collect_puit_data(arduino):
 
     db_ok = write_influx_measurement(height, resampled)
     save_previous_measure(height)
+
+    try:
+        alerts.check_thresholds(height_to_volume(height))
+    except Exception as e:
+        print(f"⚠️ Alert check failed: {e}")
+        write_influx_log(('alerts', str(e)), tag=('error', 'alert check failed'))
+
     return height, resampled, db_ok
 
 

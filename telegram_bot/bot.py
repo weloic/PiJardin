@@ -3,14 +3,18 @@
 # IMPORTS
 import os
 import sys
-import json
 import asyncio
 import logging
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+## read_puit.py lives in sensors/; when run as a script, only this folder is on sys.path.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sensors'))
+
 import read_puit
+from user_store import load_users, save_users
+from alerts import ALERT_LOW_VOLUME_M3, ALERT_CRITICAL_VOLUME_M3
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
@@ -28,7 +32,6 @@ PASSWORD_TO_ROLE = {
     if password
 }
 
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.telegram_users.json')
 MAX_FAILED_ATTEMPTS = 10
 
 # -------------------------------------------------------------------------------------------------
@@ -47,24 +50,6 @@ if not PASSWORD_TO_ROLE:
         "Neither TELEGRAM_PASSWORD_ADMIN nor TELEGRAM_PASSWORD_VIEWER is set — "
         "self-registration via /start will reject everyone."
     )
-
-# -------------------------------------------------------------------------------------------------
-# USER REGISTRY
-
-def load_users():
-    try:
-        with open(USERS_FILE, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning(f"Could not load {USERS_FILE} ({e}); starting with no registered users.")
-        return {}
-
-def save_users(users):
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump(users, f)
-    except Exception as e:
-        log.warning(f"Could not save {USERS_FILE} ({e}).")
 
 # -------------------------------------------------------------------------------------------------
 # COMMAND HANDLERS
@@ -123,21 +108,31 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You need to register first: /start <password>")
         return
 
+    thresholds = (
+        f"Seuils: {ALERT_LOW_VOLUME_M3:g} m³ (une fois) "
+        f"et {ALERT_CRITICAL_VOLUME_M3:g} m³ (rappel quotidien)."
+    )
+
     if not context.args:
         status = "on" if user.get("alerts") else "off"
-        await update.message.reply_text(f"Alerts are currently {status}. Usage: /alerts on|off")
+        await update.message.reply_text(
+            f"Alerts are currently {status}. Usage: /alertes on|off\n{thresholds}"
+        )
         return
 
     choice = context.args[0].lower()
     if choice not in ("on", "off"):
-        await update.message.reply_text("Usage: /alerts on|off")
+        await update.message.reply_text("Usage: /alertes on|off")
         return
 
     user["alerts"] = (choice == "on")
     save_users(users)
-    await update.message.reply_text(f"Alerts turned {choice}.")
+    text = f"Alerts turned {choice}."
+    if choice == "on":
+        text += f"\n{thresholds}"
+    await update.message.reply_text(text)
 
-async def mesure(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user = load_users().get(chat_id)
 
@@ -175,11 +170,9 @@ async def mesure(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("alerts", alerts))
-application.add_handler(CommandHandler(["mesure", "measure"], mesure))
+application.add_handler(CommandHandler("alertes", alerts))
+application.add_handler(CommandHandler(["mesure", "measure"], measure))
 
 # TODO: add command handler /status
-# TODO: add proactive alert logic (call from read_puit.py when level is low;
-#       recipients = [cid for cid, u in load_users().items() if u.get("alerts")])
 log.info("Starting Telegram bot polling loop.")
 application.run_polling()

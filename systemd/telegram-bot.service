@@ -15,7 +15,7 @@ Type=simple
 EnvironmentFile=@@REPO_DIR@@/.env
 
 # The Python script to execute.
-ExecStart=@@VENV_DIR@@/bin/python3 @@REPO_DIR@@/sensors/telegram_bot.py
+ExecStart=@@VENV_DIR@@/bin/python3 @@REPO_DIR@@/telegram_bot/bot.py
 
 # Run as the unprivileged user instead of root, for security.
 User=@@SERVICE_USER@@
