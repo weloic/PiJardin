@@ -4,10 +4,13 @@
 import os
 import sys
 import json
+import asyncio
 import logging
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+import read_puit
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
@@ -134,14 +137,48 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_users(users)
     await update.message.reply_text(f"Alerts turned {choice}.")
 
+async def mesure(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    # Any registered role (admin or viewer) may measure; banned entries have no role.
+    if user is None or user.get("banned") or not user.get("role"):
+        await update.message.reply_text("You need to register first: /start <password>")
+        return
+
+    msg = await update.message.reply_text("Mesure en cours, patience")
+
+    try:
+        height, resampled, db_ok = await asyncio.to_thread(read_puit.measure_once, 20)
+    except TimeoutError:
+        await msg.edit_text("Une mesure ordinaire est déjà en cours, veuillez recommencer plus tard")
+        return
+    except Exception as e:
+        log.warning(f"/mesure failed for chat {chat_id}: {e}")
+        await msg.edit_text(f"Measurement failed: {e}")
+        return
+
+    if height is None:
+        await msg.edit_text("Sensor did not return a valid reading.")
+        return
+
+    volume = read_puit.height_to_volume(height)
+    text = f"Volume: {volume:.2f} m³ ({volume * 1000:.0f} L)"
+    if resampled:
+        text += "\n(médiane de 5 échantillons)"
+    if not db_ok:
+        text += "\n⚠️ Could not write to InfluxDB — value NOT recorded in the database."
+    await msg.edit_text(text)
+
 # -------------------------------------------------------------------------------------------------
 # BOT
 
 application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("alerts", alerts))
+application.add_handler(CommandHandler(["mesure", "measure"], mesure))
 
-# TODO: add command handlers (/measure, /status)
+# TODO: add command handler /status
 # TODO: add proactive alert logic (call from read_puit.py when level is low;
 #       recipients = [cid for cid, u in load_users().items() if u.get("alerts")])
 log.info("Starting Telegram bot polling loop.")
