@@ -13,6 +13,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sensors'))
 
 import read_puit
+# graph pulls in matplotlib; guard the import so a missing/broken dependency only
+# disables the /graphe* commands rather than crashing the whole bot on startup.
+try:
+    import graph
+except Exception as e:
+    graph = None
+    logging.getLogger(__name__).warning(f"graph module unavailable ({e}); /graphe* commands disabled.")
 from user_store import load_users, save_users
 from alerts import ALERT_LOW_VOLUME_M3, ALERT_CRITICAL_VOLUME_M3
 
@@ -165,6 +172,46 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n⚠️ Could not write to InfluxDB — value NOT recorded in the database."
     await msg.edit_text(text)
 
+async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title):
+    """Query the volume history for `range_start` and reply with a rendered chart."""
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    # Any registered role (admin or viewer) may request a graph; banned entries have no role.
+    if user is None or user.get("banned") or not user.get("role"):
+        await update.message.reply_text("You need to register first: /start <password>")
+        return
+
+    if graph is None:
+        await update.message.reply_text("Graphique indisponible (dépendance manquante).")
+        return
+
+    msg = await update.message.reply_text("Génération du graphique, patience")
+
+    try:
+        times, volumes = await asyncio.to_thread(read_puit.query_volume_history, range_start)
+    except Exception as e:
+        log.warning(f"graph query failed for chat {chat_id}: {e}")
+        await msg.edit_text(f"Could not read history: {e}")
+        return
+
+    if not times:
+        await msg.edit_text("Aucune donnée sur cette période.")
+        return
+
+    png = await asyncio.to_thread(graph.render_volume_chart, times, volumes, title)
+    await update.message.reply_photo(photo=png, caption=title)
+    await msg.delete()
+
+async def graphe24h(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_graph(update, context, "-24h", "Historique 24 heures")
+
+async def graphe3j(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_graph(update, context, "-3d", "Historique 3 jours")
+
+async def graphe7j(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_graph(update, context, "-7d", "Historique 7 jours")
+
 # -------------------------------------------------------------------------------------------------
 # BOT
 
@@ -172,6 +219,9 @@ application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("alertes", alerts))
 application.add_handler(CommandHandler(["mesure", "measure"], measure))
+application.add_handler(CommandHandler("graphe24h", graphe24h))
+application.add_handler(CommandHandler("graphe3j", graphe3j))
+application.add_handler(CommandHandler("graphe7j", graphe7j))
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")

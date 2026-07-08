@@ -30,9 +30,11 @@ INFLUXDB_BUCKET = os.getenv("INFLUX_BUCKET", "puit")
 try:
     client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
     write_api = client.write_api(write_options=SYNCHRONOUS)
+    query_api = client.query_api()
 except Exception as e:
     print(f"⚠️ Could not initialize InfluxDB client: {e}; measurements will not be recorded.")
     write_api = None
+    query_api = None
 
 ## Serial communication
 SERIAL_PORT = '/dev/ttyACM0'
@@ -55,6 +57,42 @@ LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.puit.lock
 def height_to_volume(height_cm):
     """Convert the measured distance to the water surface (cm) into a volume (m³)."""
     return (PUIT_EMPTY_DISTANCE_CM - height_cm) * PUIT_M3_PER_CM
+
+def query_volume_history(range_start):
+    """Read the well's volume history from InfluxDB for the given window.
+
+    range_start: a Flux duration literal like '-24h', '-3d', '-7d'. This is a
+    fixed, caller-controlled constant (never user input), so it is safe to embed.
+
+    Returns (times, volumes_m3): two parallel lists sorted by time, where times
+    are timezone-aware UTC datetimes and volumes are m³. Returns ([], []) when
+    the query API is unavailable or the window has no data.
+    """
+    if query_api is None:
+        print("⚠️ No InfluxDB query API; cannot read history.")
+        return [], []
+
+    flux = (
+        f'from(bucket: "{INFLUXDB_BUCKET}")\n'
+        f'  |> range(start: {range_start})\n'
+        '  |> filter(fn: (r) => r._measurement == "height_measure")\n'
+        '  |> filter(fn: (r) => r._field == "lenght_median")\n'
+        '  |> keep(columns: ["_time", "_value"])\n'
+        '  |> sort(columns: ["_time"])'
+    )
+
+    times, volumes = [], []
+    try:
+        tables = query_api.query(flux, org=INFLUXDB_ORG)
+    except Exception as e:
+        print(f"⚠️ Could not query history from InfluxDB: {e}")
+        return [], []
+
+    for table in tables:
+        for record in table.records:
+            times.append(record.get_time())
+            volumes.append(height_to_volume(record.get_value()))
+    return times, volumes
 
 def open_arduino():
     arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=.1)
