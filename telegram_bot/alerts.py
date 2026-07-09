@@ -35,6 +35,15 @@ def alert_recipients():
         if user.get("alerts") and user.get("role") and not user.get("banned")
     ]
 
+def admin_recipients():
+    """Admins receive ops notifications (e.g. deploys) regardless of their
+    water-level alert opt-in, which only governs the volume-threshold alerts."""
+    return [
+        chat_id
+        for chat_id, user in load_users().items()
+        if user.get("role") == "admin" and not user.get("banned")
+    ]
+
 # -------------------------------------------------------------------------------------------------
 # ALERT STATE
 
@@ -127,12 +136,45 @@ def send_telegram(chat_ids, text):
             print(f"⚠️ Could not send alert to chat {chat_id}: {e}")
 
 # -------------------------------------------------------------------------------------------------
+# DEPLOY NOTIFICATION
+
+def notify_deploy(old, new, changelog=""):
+    """Tell admins a new version was pulled and installation finished.
+
+    Called by deploy/deploy.sh after the pull + service restarts succeed. It sends
+    over Telegram directly (not through the bot process, which is being restarted).
+    """
+    recipients = admin_recipients()
+    if not recipients:
+        print("No admin recipients; deploy notification not sent.")
+        return
+    text = f"🚀 PiJardin mis à jour et redémarré.\nVersion : {old[:7]} → {new[:7]}"
+    if changelog:
+        # Keep well under Telegram's 4096-char cap even with a long history.
+        lines = changelog.splitlines()
+        shown = lines[:15]
+        text += "\n\nChangements :\n" + "\n".join(f"• {line}" for line in shown)
+        if len(lines) > len(shown):
+            text += f"\n… (+{len(lines) - len(shown)} de plus)"
+    send_telegram(recipients, text)
+
+# -------------------------------------------------------------------------------------------------
 # MANUAL TESTING
 # Run a threshold check against a fake volume, without touching the Arduino:
 #   python alerts.py 2.8
+# Notify admins of a deploy (changelog read from stdin, one commit per line):
+#   git log --oneline OLD..NEW | python alerts.py deploy OLD NEW
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
+    if len(sys.argv) >= 2 and sys.argv[1] == 'deploy':
+        old = sys.argv[2] if len(sys.argv) > 2 else "?"
+        new = sys.argv[3] if len(sys.argv) > 3 else "?"
+        # Changelog on stdin keeps commit subjects out of the argv quoting mess.
+        changelog = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+        notify_deploy(old, new, changelog)
+    elif len(sys.argv) == 2:
+        check_thresholds(float(sys.argv[1]))
+    else:
         print("Usage: python alerts.py <volume_m3>")
+        print("       git log --oneline OLD..NEW | python alerts.py deploy OLD NEW")
         sys.exit(1)
-    check_thresholds(float(sys.argv[1]))

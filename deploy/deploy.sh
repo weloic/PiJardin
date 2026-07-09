@@ -72,4 +72,15 @@ if git diff --name-only "$OLD" "$NEW" | grep -qE "^telegram_bot/|^sensors/|^depl
     sudo systemctl restart telegram-bot.service
 fi
 
+# Notify admins over Telegram that a new version is live. Sent from here (not the
+# bot, which just restarted) via alerts.py's direct API call. The token is a shell
+# var from .env, not exported, so pass it explicitly to the subprocess. Non-fatal:
+# the deploy has already succeeded, so a notification failure must not abort it.
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    git log --oneline "$OLD..$NEW" \
+        | TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+          "$VENV_DIR/bin/python" "$REPO_DIR/telegram_bot/alerts.py" deploy "$OLD" "$NEW" \
+        || echo "WARNING: could not send deploy notification."
+fi
+
 echo "Deploy done."
