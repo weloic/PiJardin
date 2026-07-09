@@ -10,6 +10,10 @@ import subprocess
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+## systemd captures stdout block-buffered; line-buffer it so read_puit's print()
+## diagnostics reach the journal immediately (readable remotely via /logs bot).
+sys.stdout.reconfigure(line_buffering=True)
+
 ## read_puit.py lives in sensors/; when run as a script, only this folder is on sys.path.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sensors'))
 
