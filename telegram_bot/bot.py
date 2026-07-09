@@ -5,6 +5,7 @@ import os
 import sys
 import asyncio
 import logging
+import subprocess
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -40,6 +41,15 @@ PASSWORD_TO_ROLE = {
 }
 
 MAX_FAILED_ATTEMPTS = 10
+
+## Journal units readable via /logs — fixed whitelist, never user-supplied unit names.
+LOG_UNITS = {
+    "bot": "telegram-bot.service",
+    "sensors": "sensors.service",
+    "deploy": "deploy.service",
+}
+LOG_DEFAULT_LINES = 40
+LOG_MAX_LINES = 100
 
 # -------------------------------------------------------------------------------------------------
 # STARTUP CHECK
@@ -203,6 +213,49 @@ async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_s
     await update.message.reply_photo(photo=png, caption=title)
     await msg.delete()
 
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply with the tail of a service journal. Admin-only remote diagnostics."""
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    if user is None or user.get("banned") or user.get("role") != "admin":
+        await update.message.reply_text("Admin only.")
+        return
+
+    unit_alias = "bot"
+    lines = LOG_DEFAULT_LINES
+    for arg in context.args:
+        if arg.lower() in LOG_UNITS:
+            unit_alias = arg.lower()
+        elif arg.isdigit():
+            lines = min(int(arg), LOG_MAX_LINES)
+        else:
+            await update.message.reply_text(
+                f"Usage: /logs [{'|'.join(LOG_UNITS)}] [lines]"
+            )
+            return
+
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["journalctl", "-u", LOG_UNITS[unit_alias], "-n", str(lines),
+             "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=15,
+        )
+        # On permission problems journalctl often exits 0 with a hint on stderr;
+        # show whatever it produced, it is the diagnostic.
+        output = (result.stdout.strip() or result.stderr.strip()
+                  or f"(journalctl exited {result.returncode} with no output)")
+    except Exception as e:
+        await update.message.reply_text(f"Could not read journal: {e}")
+        return
+
+    # Telegram caps messages at 4096 chars; send the most recent chunks as plain
+    # text (no Markdown parse mode: journal content would break entity parsing).
+    chunks = [output[i:i + 4000] for i in range(0, len(output), 4000)]
+    for chunk in chunks[-3:]:
+        await update.message.reply_text(chunk)
+
 async def graphe24h(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_graph(update, context, "-24h", "Historique 24 heures")
 
@@ -222,6 +275,7 @@ application.add_handler(CommandHandler(["mesure", "measure"], measure))
 application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
+application.add_handler(CommandHandler("logs", logs))
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")

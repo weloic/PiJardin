@@ -20,9 +20,14 @@ fi
 
 echo "Updating $OLD -> $NEW"
 
-# Update Python deps if they changed
+# Update Python deps if they changed. Non-fatal: a failed install must not abort
+# the deploy before the service restarts below, or the bot keeps running stale
+# code in memory (a missing lib fails loudly at import instead, and graph.py is
+# already import-guarded).
 if git diff --name-only "$OLD" "$NEW" | grep -q "deploy/requirements.txt"; then
-    "$VENV_DIR/bin/pip" install -r deploy/requirements.txt
+    if ! "$VENV_DIR/bin/pip" install -r deploy/requirements.txt; then
+        echo "WARNING: pip install failed; continuing so services still restart."
+    fi
 fi
 
 # Re-bootstrap if systemd units or the bootstrap script itself changed.
@@ -54,11 +59,16 @@ if git diff --name-only "$OLD" "$NEW" | grep -q "^grafana/"; then
     fi
 fi
 
-# Restart the sensor service
-sudo systemctl restart sensors.service
+# Kick off a sensor run only when its code changed. --no-block: the service is a
+# oneshot that performs a full measurement, and a transient measurement failure
+# must not abort the deploy (sensors.timer re-runs it within 5 minutes anyway).
+if git diff --name-only "$OLD" "$NEW" | grep -qE "^sensors/"; then
+    sudo systemctl restart --no-block sensors.service
+fi
 
-# Restart the bot if anything in its folder changed (token picked up from .env automatically)
-if git diff --name-only "$OLD" "$NEW" | grep -q "^telegram_bot/"; then
+# Restart the bot if its code, the sensor module it imports, or the Python deps
+# changed (token picked up from .env automatically)
+if git diff --name-only "$OLD" "$NEW" | grep -qE "^telegram_bot/|^sensors/|^deploy/requirements.txt"; then
     sudo systemctl restart telegram-bot.service
 fi
 
