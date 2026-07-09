@@ -95,9 +95,21 @@ def query_volume_history(range_start):
     return times, volumes
 
 def open_arduino():
-    arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=.1)
+    # Open with DTR deasserted, then assert it: the edge auto-resets the Arduino
+    # deterministically. Relying on open() alone is not enough — whether it
+    # produces a reset edge depends on the DTR state left by the previous
+    # session, and an un-reset board serves a stale reading (frozen /mesure bug:
+    # no boot banner in the journal, constant 61.00 response).
+    arduino = serial.Serial()
+    arduino.port = SERIAL_PORT
+    arduino.baudrate = BAUD_RATE
+    arduino.timeout = .1
+    arduino.dtr = False
+    arduino.open()
+    time.sleep(0.25)
+    arduino.dtr = True
 
-    # Opening the port resets the Arduino (DTR); wait for it to come back up
+    # The reset pulse rebooted the Arduino; wait for it to come back up
     print("Waiting for Arduino to start serial communication...")
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -232,12 +244,11 @@ def collect_puit_data(arduino):
     return height, resampled, db_ok
 
 
-def measure_once(lock_timeout=0):
-    """Run one full measurement cycle: lock, open serial, measure (+DB write), clean up.
+def _with_arduino(lock_timeout, action):
+    """Serialize serial-port access (flock) and run `action(arduino)` on a fresh port.
 
-    Returns (height, resampled, db_ok); height is None if the sensor gave no valid
-    reading. Raises TimeoutError if another measurement holds the lock past
-    lock_timeout seconds.
+    Raises TimeoutError if another measurement holds the lock past lock_timeout
+    seconds.
     """
     import fcntl  # Linux-only; imported here so the module loads on dev machines
 
@@ -255,11 +266,41 @@ def measure_once(lock_timeout=0):
 
         arduino = open_arduino()
         try:
-            return collect_puit_data(arduino)
+            return action(arduino)
         finally:
             arduino.close()
     finally:
         lock_fd.close()  # releases the flock
+
+
+def measure_once(lock_timeout=0):
+    """Run one full measurement cycle: lock, open serial, measure (+DB write), clean up.
+
+    Returns (height, resampled, db_ok); height is None if the sensor gave no valid
+    reading. Raises TimeoutError if another measurement holds the lock past
+    lock_timeout seconds.
+    """
+    return _with_arduino(lock_timeout, collect_puit_data)
+
+
+def raw_samples_once(lock_timeout=0):
+    """Ask the Arduino for its raw ping array (SAMPLING command) — diagnostics only.
+
+    Returns the raw JSON-ish line (e.g. "[61.00, 61.00, 158.00, ...]") or None if
+    the Arduino did not answer. Raises TimeoutError like measure_once.
+    """
+    def action(arduino):
+        arduino.reset_input_buffer()
+        arduino.write(b'SAMPLING\n')
+        # 10 pings, worst case ~1 s each when an echo times out.
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            line = arduino.readline().decode('utf-8', errors='ignore').strip()
+            if line:
+                return line
+        return None
+
+    return _with_arduino(lock_timeout, action)
 
 
 def roundTime(dt=None, roundTo=60):

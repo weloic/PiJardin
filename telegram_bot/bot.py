@@ -34,6 +34,10 @@ from alerts import ALERT_LOW_VOLUME_M3, ALERT_CRITICAL_VOLUME_M3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+## httpx logs every polling request at INFO — including the bot token in the URL.
+## Keep it (and the journal read via /logs) quiet unless something goes wrong.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 PASSWORD_ADMIN  = os.getenv("TELEGRAM_PASSWORD_ADMIN")
@@ -217,6 +221,33 @@ async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_s
     await update.message.reply_photo(photo=png, caption=title)
     await msg.delete()
 
+async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Relay the Arduino's raw ping array (SAMPLING) — admin sensor diagnostics."""
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    if user is None or user.get("banned") or user.get("role") != "admin":
+        await update.message.reply_text("Admin only.")
+        return
+
+    msg = await update.message.reply_text("Lecture des échantillons bruts, patience")
+
+    try:
+        raw = await asyncio.to_thread(read_puit.raw_samples_once, 20)
+    except TimeoutError:
+        await msg.edit_text("Une mesure ordinaire est déjà en cours, veuillez recommencer plus tard")
+        return
+    except Exception as e:
+        log.warning(f"/echantillons failed for chat {chat_id}: {e}")
+        await msg.edit_text(f"Sampling failed: {e}")
+        return
+
+    if raw is None:
+        await msg.edit_text("Le capteur n'a pas répondu.")
+        return
+
+    await msg.edit_text(f"Échantillons bruts (cm) :\n{raw}")
+
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply with the tail of a service journal. Admin-only remote diagnostics."""
     chat_id = str(update.effective_chat.id)
@@ -280,6 +311,7 @@ application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
+application.add_handler(CommandHandler("echantillons", samples))
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")
