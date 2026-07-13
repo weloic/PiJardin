@@ -190,7 +190,7 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n⚠️ Could not write to InfluxDB — value NOT recorded in the database."
     await msg.edit_text(text)
 
-async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title):
+async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title, autoscale_y=False):
     """Query the volume history for `range_start` and reply with a rendered chart."""
     chat_id = str(update.effective_chat.id)
     user = load_users().get(chat_id)
@@ -217,7 +217,7 @@ async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_s
         await msg.edit_text("Aucune donnée sur cette période.")
         return
 
-    png = await asyncio.to_thread(graph.render_volume_chart, times, volumes, title)
+    png = await asyncio.to_thread(graph.render_volume_chart, times, volumes, title, autoscale_y)
     await update.message.reply_photo(photo=png, caption=title)
     await msg.delete()
 
@@ -292,7 +292,7 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 async def graphe24h(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_graph(update, context, "-24h", "Historique 24 heures")
+    await send_graph(update, context, "-24h", "Historique 24 heures", autoscale_y=True)
 
 async def graphe3j(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_graph(update, context, "-3d", "Historique 3 jours")

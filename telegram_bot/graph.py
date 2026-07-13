@@ -23,7 +23,7 @@ LINE_COLOR = "#3fa34d"
 # -------------------------------------------------------------------------------------------------
 # FUNCTIONS
 
-def render_volume_chart(times, volumes_m3, title):
+def render_volume_chart(times, volumes_m3, title, autoscale_y=False):
     """Render a volume-over-time line chart to PNG bytes.
 
     times: list of timezone-aware (UTC) datetimes.
@@ -36,11 +36,18 @@ def render_volume_chart(times, volumes_m3, title):
 
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
     ax.plot(local_times, volumes_m3, color=LINE_COLOR, linewidth=1.6)
-    ax.fill_between(local_times, volumes_m3, color=LINE_COLOR, alpha=0.12)
 
     ax.set_title(title)
     ax.set_ylabel("Volume (m³)")
-    ax.set_ylim(bottom=0)
+    if autoscale_y:
+        lo, hi = min(volumes_m3), max(volumes_m3)
+        pad = (hi - lo) * 0.1 or (abs(hi) * 0.01 or 1)
+        ax.set_ylim(lo - pad, hi + pad)
+        baseline = lo - pad
+    else:
+        ax.set_ylim(bottom=0)
+        baseline = 0
+    ax.fill_between(local_times, volumes_m3, baseline, color=LINE_COLOR, alpha=0.12)
     ax.grid(True, alpha=0.3)
 
     ## Let matplotlib pick sensible date ticks for the window, formatted compactly.
