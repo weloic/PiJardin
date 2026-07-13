@@ -2,3 +2,4 @@ influxdb-client
 pyserial
 numpy
 python-telegram-bot
+matplotlib
