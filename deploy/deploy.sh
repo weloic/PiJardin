@@ -72,6 +72,45 @@ if git diff --name-only "$OLD" "$NEW" | grep -qE "^telegram_bot/|^sensors/|^depl
     sudo systemctl restart telegram-bot.service
 fi
 
+# Run any pending one-time migrations. A migration is a script in deploy/migrations/
+# that must execute exactly once on this Pi (e.g. a data backfill, a firmware flash).
+# Applied names are recorded in a gitignored ledger so `git reset --hard` above never
+# re-runs them. Placed last (before the notification) so migrations see fully-updated
+# code, deps and services. Non-fatal to the deploy; a failed migration stays unrecorded
+# and is retried on the next deploy tick.
+MIGRATIONS_DIR="$REPO_DIR/deploy/migrations"
+LEDGER="$REPO_DIR/deploy/.migrations_applied"
+touch "$LEDGER"
+
+if [ -d "$MIGRATIONS_DIR" ]; then
+    # Glob expands sorted, so the NNNN_ prefix defines run order.
+    for path in "$MIGRATIONS_DIR"/*; do
+        [ -f "$path" ] || continue
+        name="$(basename "$path")"
+        [ "$name" = "README.md" ] && continue
+        grep -qxF "$name" "$LEDGER" && continue          # already applied
+
+        echo "Running migration: $name"
+        # Env passed explicitly (not exported), matching the notification call below.
+        # `bash "$path"` avoids depending on the file's exec bit surviving git/Windows.
+        if REPO_DIR="$REPO_DIR" VENV_DIR="$VENV_DIR" \
+           TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" bash "$path"; then
+            echo "$name" >> "$LEDGER"
+        else
+            echo "WARNING: migration $name failed; will retry next deploy."
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+                TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" "$VENV_DIR/bin/python" -c \
+                    "import sys; sys.path.insert(0, '$REPO_DIR/telegram_bot'); import alerts; \
+                     alerts.send_telegram(alerts.admin_recipients(), '⚠️ Migration $name failed — check journalctl -u deploy.service')" \
+                    || echo "WARNING: could not send migration-failure notification."
+            fi
+            # Stop at the first failure: later migrations may depend on this one, so
+            # preserve ordering and retry this + all following ones next deploy.
+            break
+        fi
+    done
+fi
+
 # Notify admins over Telegram that a new version is live. Sent from here (not the
 # bot, which just restarted) via alerts.py's direct API call. The token is a shell
 # var from .env, not exported, so pass it explicitly to the subprocess. Non-fatal:
