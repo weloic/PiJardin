@@ -22,6 +22,8 @@ if ! command -v bossac > /dev/null; then
     echo "Installing bossa-cli (bossac) for Arduino flashing..."
     sudo apt-get install -y bossa-cli || echo "WARNING: bossa-cli install failed; /flash will not work until it is installed."
 fi
+# Always report the result so it is visible in `/logs deploy` on every deploy.
+echo "bossac: $(command -v bossac || echo 'MISSING')"
 
 # Expand @@PLACEHOLDER@@ tokens in each unit file before copying to systemd.
 for f in "$REPO_DIR"/systemd/*.service "$REPO_DIR"/systemd/*.timer; do
