@@ -7,6 +7,7 @@ import serial
 import os
 import sys
 import json
+import contextlib
 from numpy import median
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -244,17 +245,20 @@ def collect_puit_data(arduino):
     return height, resampled, db_ok
 
 
-def _with_arduino(lock_timeout, action):
-    """Serialize serial-port access (flock) and run `action(arduino)` on a fresh port.
+@contextlib.contextmanager
+def puit_lock(timeout):
+    """Hold an exclusive flock on LOCK_FILE for the duration of the `with` block.
 
-    Raises TimeoutError if another measurement holds the lock past lock_timeout
-    seconds.
+    This is the single cross-process gate on the serial port: the scheduled
+    sensors.service run, the Telegram bot's /mesure, and firmware flashing all take
+    it so only one of them drives /dev/ttyACM0 at a time. Raises TimeoutError if the
+    lock is not acquired within `timeout` seconds.
     """
     import fcntl  # Linux-only; imported here so the module loads on dev machines
 
     lock_fd = open(LOCK_FILE, 'w')
     try:
-        deadline = time.time() + lock_timeout
+        deadline = time.time() + timeout
         while True:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -263,14 +267,23 @@ def _with_arduino(lock_timeout, action):
                 if time.time() >= deadline:
                     raise TimeoutError("Another measurement is already in progress.")
                 time.sleep(0.5)
+        yield
+    finally:
+        lock_fd.close()  # releases the flock
 
+
+def _with_arduino(lock_timeout, action):
+    """Serialize serial-port access (flock) and run `action(arduino)` on a fresh port.
+
+    Raises TimeoutError if another measurement holds the lock past lock_timeout
+    seconds.
+    """
+    with puit_lock(lock_timeout):
         arduino = open_arduino()
         try:
             return action(arduino)
         finally:
             arduino.close()
-    finally:
-        lock_fd.close()  # releases the flock
 
 
 def measure_once(lock_timeout=0):

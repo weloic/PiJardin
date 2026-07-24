@@ -248,6 +248,47 @@ async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"Échantillons bruts (cm) :\n{raw}")
 
+async def flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Flash the committed firmware.bin onto the Arduino — admin-only ops action.
+
+    Runs arduino/flash_firmware.py as a subprocess (the same entry point the deploy
+    migration uses) and relays its output. The script stops sensors.timer and takes
+    the serial-port flock itself, so a concurrent /mesure just waits."""
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    if user is None or user.get("banned") or user.get("role") != "admin":
+        await update.message.reply_text("Admin only.")
+        return
+
+    msg = await update.message.reply_text("Flash du firmware Arduino en cours (~1 min), patience")
+
+    script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "arduino", "flash_firmware.py")
+    try:
+        # sys.executable is the venv python (the service runs the bot with it).
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, script],
+            capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        await msg.edit_text(
+            "Flash timed out; the board may be in the bootloader. /flash again or check /logs bot.")
+        return
+    except Exception as e:
+        log.warning(f"/flash failed to start for chat {chat_id}: {e}")
+        await msg.edit_text(f"Flash failed to start: {e}")
+        return
+
+    output = (result.stdout + result.stderr).strip() or f"(exited {result.returncode}, no output)"
+    # Plain text (no Markdown: bossac output would break entity parsing); chunk under
+    # Telegram's 4096-char cap. The final FLASH OK|WARN|FAIL line lands in the last chunk.
+    chunks = [output[i:i + 4000] for i in range(0, len(output), 4000)]
+    await msg.edit_text(chunks[0])
+    for chunk in chunks[1:]:
+        await update.message.reply_text(chunk)
+
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply with the tail of a service journal. Admin-only remote diagnostics."""
     chat_id = str(update.effective_chat.id)
@@ -312,6 +353,7 @@ application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
 application.add_handler(CommandHandler("echantillons", samples))
+application.add_handler(CommandHandler("flash", flash))
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")

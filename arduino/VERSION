@@ -1,0 +1,6 @@
+# Metadata for the committed firmware.bin. Read by flash_firmware.py (version=)
+# and reported on a successful flash. Bump this whenever firmware.bin changes.
+# No firmware.bin is committed yet — this is a placeholder (STEP 2).
+version=none
+source_commit=none
+built=none

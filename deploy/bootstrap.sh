@@ -15,6 +15,14 @@ fi
 # shellcheck source=../.env
 source "$REPO_DIR/.env"
 
+# bossac uploads firmware to the Arduino XIAO SAMD21 (used by arduino/flash_firmware.py).
+# Guarded so re-bootstraps stay fast; deploy.sh re-runs this script whenever it changes,
+# so pushing the change installs bossac on the Pi with no SSH.
+if ! command -v bossac > /dev/null; then
+    echo "Installing bossa-cli (bossac) for Arduino flashing..."
+    sudo apt-get install -y bossa-cli || echo "WARNING: bossa-cli install failed; /flash will not work until it is installed."
+fi
+
 # Expand @@PLACEHOLDER@@ tokens in each unit file before copying to systemd.
 for f in "$REPO_DIR"/systemd/*.service "$REPO_DIR"/systemd/*.timer; do
     sed \
