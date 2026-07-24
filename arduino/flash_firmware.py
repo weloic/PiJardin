@@ -13,9 +13,11 @@ Procedure:
   4. bossac writes the image at offset 0x2000 (above the bootloader) and resets.
   5. Verify: reopen at the normal baud, expect the boot banner and a real reading.
 
-Exit codes: 0 OK, 1 no firmware, 2 no bootloader port, 3 bossac failed,
-4 flashed-but-unverified (WARN), 5 serial port busy. Every path prints one final
-line starting "FLASH OK|WARN|FAIL:" for the bot / journal to relay.
+Exit codes: 0 OK or WARN (bossac verified the write; readback is only an extra
+health check, so a WARN still exits 0 to avoid re-flashing an already-verified
+binary), 1 no firmware, 2 no bootloader port, 3 bossac failed, 5 serial port busy.
+Every path prints one final line starting "FLASH OK|WARN|FAIL:" for the bot /
+journal to relay.
 
 Usage:  python flash_firmware.py [--notify-admins]
 """
