@@ -122,4 +122,13 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
         || echo "WARNING: could not send deploy notification."
 fi
 
+# Record a Point('version') marker in InfluxDB (Pi commit, Arduino firmware, Grafana config)
+# so a version change can be overlaid as a Grafana annotation. The InfluxDB vars are shell
+# vars from .env (sourced above, not exported), so pass them explicitly to the subprocess.
+# Non-fatal: the deploy has already succeeded.
+INFLUX_URL="${INFLUX_URL:-}" INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-}" \
+INFLUX_ORG="${INFLUX_ORG:-}" INFLUX_BUCKET="${INFLUX_BUCKET:-}" \
+    "$VENV_DIR/bin/python" "$REPO_DIR/sensors/read_puit.py" record-version deploy \
+    || echo "WARNING: could not record version marker."
+
 echo "Deploy done."

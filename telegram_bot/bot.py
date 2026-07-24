@@ -10,33 +10,33 @@ import subprocess
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-## systemd captures stdout block-buffered; line-buffer it so read_puit's print()
-## diagnostics reach the journal immediately (readable remotely via /logs bot).
-sys.stdout.reconfigure(line_buffering=True)
-
-## read_puit.py lives in sensors/; when run as a script, only this folder is on sys.path.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sensors'))
+## read_puit.py lives in sensors/; the shared `common` package lives at the repo root. Both
+## on sys.path so this script can import them when run directly by the service.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+sys.path.insert(0, os.path.join(_REPO, 'sensors'))
 
 import read_puit
+from common.logging_setup import setup_logging
+
+## Configure logging first (stdout -> journald, line-buffered, httpx muzzled). The bot does
+## NOT attach the InfluxDB handler: it is an add-on and never writes to the DB — its logs live
+## in journald only (readable via /logs bot). A dead bot is caught by the systemd OnFailure hook.
+setup_logging()
+log = logging.getLogger(__name__)
+
 # graph pulls in matplotlib; guard the import so a missing/broken dependency only
 # disables the /graphe* commands rather than crashing the whole bot on startup.
 try:
     import graph
 except Exception as e:
     graph = None
-    logging.getLogger(__name__).warning(f"graph module unavailable ({e}); /graphe* commands disabled.")
+    log.warning(f"graph module unavailable ({e}); /graphe* commands disabled.")
 from user_store import load_users, save_users
 from alerts import ALERT_LOW_VOLUME_M3, ALERT_CRITICAL_VOLUME_M3
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-## httpx logs every polling request at INFO — including the bot token in the URL.
-## Keep it (and the journal read via /logs) quiet unless something goes wrong.
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 

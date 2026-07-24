@@ -7,15 +7,24 @@ import serial
 import os
 import sys
 import json
+import logging
 import contextlib
 from numpy import median
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-## alerts.py lives in telegram_bot/; when run as a script, only sensors/ is on sys.path.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'telegram_bot'))
+## Repo root (for the `common` package) and telegram_bot/ (for alerts) on sys.path; when run
+## as a script, only sensors/ is on it.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+sys.path.insert(0, os.path.join(_REPO, 'telegram_bot'))
 import alerts
+from common.logging_setup import (
+    setup_logging, attach_influx_handler, pi_version, arduino_version, grafana_version,
+)
+
+log = logging.getLogger('read_puit')
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
@@ -33,7 +42,7 @@ try:
     write_api = client.write_api(write_options=SYNCHRONOUS)
     query_api = client.query_api()
 except Exception as e:
-    print(f"⚠️ Could not initialize InfluxDB client: {e}; measurements will not be recorded.")
+    log.warning(f"Could not initialize InfluxDB client: {e}; measurements will not be recorded.")
     write_api = None
     query_api = None
 
@@ -70,7 +79,7 @@ def query_volume_history(range_start):
     the query API is unavailable or the window has no data.
     """
     if query_api is None:
-        print("⚠️ No InfluxDB query API; cannot read history.")
+        log.warning("No InfluxDB query API; cannot read history.")
         return [], []
 
     flux = (
@@ -86,7 +95,7 @@ def query_volume_history(range_start):
     try:
         tables = query_api.query(flux, org=INFLUXDB_ORG)
     except Exception as e:
-        print(f"⚠️ Could not query history from InfluxDB: {e}")
+        log.warning(f"Could not query history from InfluxDB: {e}")
         return [], []
 
     for table in tables:
@@ -111,22 +120,22 @@ def open_arduino():
     arduino.dtr = True
 
     # The reset pulse rebooted the Arduino; wait for it to come back up
-    print("Waiting for Arduino to start serial communication...")
+    log.info("Waiting for Arduino to start serial communication...")
     deadline = time.time() + 10
     while time.time() < deadline:
         line = arduino.readline().decode('utf-8', errors='ignore').strip()
         if line:
-            print(f"Arduino says: {line}")
+            log.info(f"Arduino says: {line}")
         if line == "Started serial com":
             break
         time.sleep(0.1)
-    print("Proceeding (ready or timeout).")
+    log.info("Proceeding (ready or timeout).")
     arduino.reset_input_buffer()
     return arduino
 
 def get_sensor_data(arduino, retries=3, delay=0.5):
     for attempt in range(retries):
-        print(f'Get sensor data (attempt {attempt + 1})')
+        log.info(f'Get sensor data (attempt {attempt + 1})')
         arduino.write(b'READ_PUIT\n')
         time.sleep(delay)
         raw = arduino.readline()
@@ -134,15 +143,14 @@ def get_sensor_data(arduino, retries=3, delay=0.5):
         if raw:
             try:
                 height_str = raw.decode('utf-8').strip()
-                print('received data:', height_str)
+                log.info(f'received data: {height_str}')
                 return float(height_str)
             except ValueError:
-                print("⚠️ Invalid float format.")
-                write_influx_log(('arduino', raw), tag=('error', 'Invalid float format'))
+                # WARNING+ auto-records to InfluxDB via the handler; keep the raw value.
+                log.warning(f"Invalid float format from Arduino: {raw!r}")
         else:
-            print("No response from Arduino.")
-    print("❌ Failed to get valid sensor data after retries.")
-    write_influx_log(('arduino', 'no response'))
+            log.info("No response from Arduino.")
+    log.error("Failed to get valid sensor data after retries.")
     return None
 
 def load_previous_measure():
@@ -154,7 +162,7 @@ def load_previous_measure():
             return float(value)
         return None
     except Exception as e:
-        print(f"Warning: could not load previous measure ({e}); treating as unknown.")
+        log.warning(f"Could not load previous measure ({e}); treating as unknown.")
         return None
 
 def save_previous_measure(height):
@@ -162,39 +170,67 @@ def save_previous_measure(height):
         with open(STATE_FILE, 'w') as f:
             json.dump({'previous_measure': height}, f)
     except Exception as e:
-        print(f"Warning: could not save previous measure ({e}).")
+        log.warning(f"Could not save previous measure ({e}).")
 
-def write_influx_log(log, tag=None):
+def write_influx_version(event='deploy'):
+    """Record a Point('version') marking the currently-deployed versions.
+
+    Written from deploy/deploy.sh (event='deploy') and on a successful firmware flash
+    (event='flash'), so Grafana can annotate version changes across every panel. Fields
+    are pi_version (repo git hash), arduino_version (arduino/VERSION) and grafana_version
+    (grafana/ subtree hash — changes only when the dashboards/config do). Best-effort.
+    """
     if write_api is None:
+        log.warning("No InfluxDB write API; version marker not recorded.")
         return False
 
-    (field_name, field_value) = log
     point = (
-        Point('log')
-        .field(field_name, field_value)
+        Point('version')
+        .tag('event', event)
+        .field('pi_version', pi_version(_REPO))
+        .field('arduino_version', arduino_version(_REPO))
+        .field('grafana_version', grafana_version(_REPO))
     )
-    if tag is not None:
-        (tag_name, tag_value) = tag
-        point.tag(tag_name, tag_value)
-
-    # Write data to InfluxDB
     try:
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
         return True
     except Exception as e:
-        print(f"⚠️ Could not write log to InfluxDB: {e}")
+        log.warning(f"Could not write version marker to InfluxDB: {e}")
+        return False
+
+def write_service_failure(unit):
+    """Record a CRITICAL Point('log') for a systemd unit that entered its failed state.
+
+    Called by the pijardin-onfailure@ unit (see systemd/) so a crashed service — e.g. the
+    Telegram bot, which never writes to InfluxDB itself — still leaves a trace in the DB.
+    """
+    if write_api is None:
+        log.warning("No InfluxDB write API; service-failure not recorded.")
+        return False
+
+    point = (
+        Point('log')
+        .tag('level', 'CRITICAL')
+        .tag('source', unit)
+        .field('message', 'systemd: service entered failed state')
+    )
+    try:
+        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+        return True
+    except Exception as e:
+        log.warning(f"Could not write service-failure to InfluxDB: {e}")
         return False
 
 def write_influx_measurement(heigth_median, resampled=False):
     if write_api is None:
-        print("⚠️ No InfluxDB write API; measurement not recorded.")
+        log.warning("No InfluxDB write API; measurement not recorded.")
         return False
 
     # Timestamp rounded to the nearest 5 minutes; must be UTC-aware because the
     # client interprets naive datetimes as UTC
     rounded = roundTime(datetime.datetime.now(datetime.timezone.utc), roundTo=300)
 
-    print('Write influxdb time', rounded.isoformat())
+    log.info(f'Write influxdb time {rounded.isoformat()}')
     # Create a data point for InfluxDB
     point = (
         Point('height_measure')  # Measurement name
@@ -208,7 +244,7 @@ def write_influx_measurement(heigth_median, resampled=False):
         write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
         return True
     except Exception as e:
-        print(f"⚠️ Could not write measurement to InfluxDB: {e}")
+        log.error(f"Could not write measurement to InfluxDB: {e}")
         return False
 
 
@@ -220,7 +256,7 @@ def collect_puit_data(arduino):
     height = get_sensor_data(arduino)
 
     if height is None:
-        print("No valid height reading this run; skipping write.")
+        log.warning("No valid height reading this run; skipping write.")
         return None, False, False
 
     if previous_measure is not None:
@@ -239,8 +275,7 @@ def collect_puit_data(arduino):
     try:
         alerts.check_thresholds(height_to_volume(height))
     except Exception as e:
-        print(f"⚠️ Alert check failed: {e}")
-        write_influx_log(('alerts', str(e)), tag=('error', 'alert check failed'))
+        log.error(f"Alert check failed: {e}")
 
     return height, resampled, db_ok
 
@@ -331,13 +366,29 @@ def roundTime(dt=None, roundTo=60):
 # SCHEDULING
 
 if __name__ == '__main__':
+    setup_logging()
+
+    # CLI sub-commands used by deploy/deploy.sh and the systemd OnFailure hook. These only
+    # record a point and exit — they never touch the serial port.
+    if len(sys.argv) >= 2 and sys.argv[1] == 'record-version':
+        event = sys.argv[2] if len(sys.argv) > 2 else 'deploy'
+        sys.exit(0 if write_influx_version(event) else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'record-failure':
+        unit = sys.argv[2] if len(sys.argv) > 2 else 'unknown'
+        sys.exit(0 if write_service_failure(unit) else 1)
+
+    # Normal scheduled run: record data-path WARNING+ to InfluxDB, then measure. Attached
+    # here (not on import) so the Telegram bot, which imports this module, never writes logs
+    # to InfluxDB — only the sensors.service process does.
+    attach_influx_handler(write_api, INFLUXDB_BUCKET, INFLUXDB_ORG)
+
     try:
         height, resampled, db_ok = measure_once(lock_timeout=60)
     except TimeoutError as e:
-        print(f"❌ {e}")
+        log.error(str(e))
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Could not open serial port {SERIAL_PORT}: {e}")
+        log.error(f"Could not open serial port {SERIAL_PORT}: {e}")
         sys.exit(1)
 
     if height is None or not db_ok:

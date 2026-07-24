@@ -6,6 +6,9 @@
 Description=Telegram bot for PiJardin
 After=network-online.target
 Wants=network-online.target
+# When the bot enters its failed state, record it in InfluxDB (the bot never writes there
+# itself). %n expands to this unit's name, passed to the handler as its instance.
+OnFailure=pijardin-onfailure@%n.service
 
 [Service]
 # simple means: the process is the bot itself; systemd tracks it as long as it runs.

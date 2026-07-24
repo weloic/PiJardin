@@ -3,9 +3,12 @@
 # IMPORTS
 import os
 import json
+import logging
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
+
+log = logging.getLogger(__name__)
 
 ## Registered Telegram users (shared by bot.py and alerts.py)
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.telegram_users.json')
@@ -18,7 +21,7 @@ def load_users():
         with open(USERS_FILE, 'r') as f:
             return json.load(f)
     except Exception as e:
-        print(f"Warning: could not load {USERS_FILE} ({e}); no registered users.")
+        log.warning(f"Could not load {USERS_FILE} ({e}); no registered users.")
         return {}
 
 def save_users(users):
@@ -26,4 +29,4 @@ def save_users(users):
         with open(USERS_FILE, 'w') as f:
             json.dump(users, f)
     except Exception as e:
-        print(f"Warning: could not save {USERS_FILE} ({e}).")
+        log.warning(f"Could not save {USERS_FILE} ({e}).")

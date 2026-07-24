@@ -1,0 +1,21 @@
+# Records a CRITICAL log point in InfluxDB when a monitored unit enters its failed state,
+# so a crashed service — e.g. the Telegram bot, which never writes to InfluxDB itself —
+# still leaves a trace. Referenced via OnFailure=pijardin-onfailure@%n.service in the
+# monitored units; %i is then the failed unit's name (e.g. telegram-bot.service).
+# NOTE: @@PLACEHOLDER@@ tokens are substituted by deploy/bootstrap.sh at install time.
+
+[Unit]
+Description=Record PiJardin service failure for %i
+
+[Service]
+# oneshot: record the point and exit.
+Type=oneshot
+
+# Inject InfluxDB connection vars (and the rest of .env) into the process environment.
+EnvironmentFile=@@REPO_DIR@@/.env
+
+# read_puit's record-failure CLI writes the CRITICAL Point('log'); %i is the failed unit.
+ExecStart=@@VENV_DIR@@/bin/python3 @@REPO_DIR@@/sensors/read_puit.py record-failure %i
+
+# Run as the unprivileged user instead of root, for security.
+User=@@SERVICE_USER@@

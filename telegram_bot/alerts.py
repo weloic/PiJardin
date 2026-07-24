@@ -4,11 +4,20 @@
 import os
 import sys
 import json
+import logging
 import datetime
 import urllib.parse
 import urllib.request
 
 from user_store import load_users
+
+## Repo root on sys.path so the shared `common` package is importable when alerts.py is run
+## as a script (python alerts.py ...); when imported by read_puit/bot it is already there.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+from common.logging_setup import setup_logging
+
+log = logging.getLogger('alerts')
 
 # -------------------------------------------------------------------------------------------------
 # CONFIGURATION
@@ -59,7 +68,7 @@ def save_alert_state(state):
         with open(ALERT_STATE_FILE, 'w') as f:
             json.dump(state, f)
     except Exception as e:
-        print(f"Warning: could not save {ALERT_STATE_FILE} ({e}).")
+        log.warning(f"Could not save {ALERT_STATE_FILE} ({e}).")
 
 # -------------------------------------------------------------------------------------------------
 # THRESHOLD LOGIC
@@ -123,7 +132,7 @@ def check_thresholds(volume_m3):
 def send_telegram(chat_ids, text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("⚠️ TELEGRAM_BOT_TOKEN not set; alert not sent.")
+        log.warning("TELEGRAM_BOT_TOKEN not set; alert not sent.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     for chat_id in chat_ids:
@@ -131,9 +140,9 @@ def send_telegram(chat_ids, text):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10) as resp:
                 resp.read()
-            print(f"Alert sent to chat {chat_id}.")
+            log.info(f"Alert sent to chat {chat_id}.")
         except Exception as e:
-            print(f"⚠️ Could not send alert to chat {chat_id}: {e}")
+            log.error(f"Could not send alert to chat {chat_id}: {e}")
 
 # -------------------------------------------------------------------------------------------------
 # DEPLOY NOTIFICATION
@@ -146,7 +155,7 @@ def notify_deploy(old, new, changelog=""):
     """
     recipients = admin_recipients()
     if not recipients:
-        print("No admin recipients; deploy notification not sent.")
+        log.info("No admin recipients; deploy notification not sent.")
         return
     text = f"🚀 PiJardin mis à jour et redémarré.\nVersion : {old[:7]} → {new[:7]}"
     if changelog:
@@ -166,6 +175,7 @@ def notify_deploy(old, new, changelog=""):
 #   git log --oneline OLD..NEW | python alerts.py deploy OLD NEW
 
 if __name__ == '__main__':
+    setup_logging()
     if len(sys.argv) >= 2 and sys.argv[1] == 'deploy':
         old = sys.argv[2] if len(sys.argv) > 2 else "?"
         new = sys.argv[3] if len(sys.argv) > 3 else "?"

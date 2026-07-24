@@ -22,6 +22,28 @@ And visualize output using:
 journalctl -u sensors.service -n 30
 ```
 
+## Logging
+
+All Python components log through the standard `logging` module (configured once in
+`common/logging_setup.py`) to **stdout → journald** — no log files, no rotation; systemd's
+journal owns retention. Lines are formatted `LEVEL [module] message`; journald adds the
+timestamp. Set `LOG_LEVEL` in `.env` (default `INFO`) to change verbosity without a code change.
+
+Read logs on the Pi with `journalctl -u <unit>`, or remotely (admin only) via the Telegram
+`/logs [bot|sensors|deploy] [lines]` command.
+
+**InfluxDB records only serious events** (the DB is for managing the project; the Telegram bot
+is an add-on and never writes to it):
+- **`log` measurement** — every `WARNING`+ from the scheduled `sensors.service` data path
+  (`read_puit`/`alerts`), written automatically. Tags: `level`, `source`; field: `message`.
+- **`version` measurement** — a marker written by `deploy.sh` on each deploy (`event=deploy`)
+  and by `flash_firmware.py` on a successful flash (`event=flash`). Fields: `pi_version`
+  (repo git hash), `arduino_version` (`arduino/VERSION`), `grafana_version` (grafana/ subtree
+  hash). Add it as a Grafana annotation query to overlay version changes on any panel.
+- **service down** — if `telegram-bot.service` fails, systemd's `OnFailure` hook
+  (`pijardin-onfailure@.service`) writes a `CRITICAL` `log` point (`source=<unit>`), so a dead
+  bot still leaves a trace even though it can't report on itself.
+
 ## Telegram bot deploy
 Once .env is set, run following to deploy:
 ```
