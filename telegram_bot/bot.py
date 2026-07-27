@@ -412,6 +412,46 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=buf, filename=payload["filename"], caption=payload["caption"])
 
+## /help text (HTML). Literal <, >, & are pre-escaped; examples go in <pre> blocks. The admin
+## section is appended only for admins.
+HELP_GENERAL = (
+    "<b>Commandes PiJardin</b>\n"
+    "\n"
+    "<b>/mesure</b> — mesure le niveau du puits maintenant (alias <b>/measure</b>)\n"
+    "<b>/alertes</b> [on|off] — active/désactive les alertes de volume bas ; "
+    "sans argument, affiche l'état actuel et les seuils\n"
+    "<b>/graphe24h</b> · <b>/graphe3j</b> · <b>/graphe7j</b> — graphique du volume "
+    "sur 24 h / 3 jours / 7 jours\n"
+    "<b>/help</b> — affiche cette aide\n"
+    "\n"
+    "<b>Inscription</b>\n"
+    "<b>/start</b> &lt;mot de passe&gt; — s'enregistrer ; le mot de passe détermine le rôle "
+    "(admin ou viewer)\n"
+    "<pre>/start monMotDePasse</pre>"
+)
+
+HELP_ADMIN = (
+    "\n<b>Admin</b>\n"
+    "<b>/echantillons</b> — mesures brutes du capteur (diagnostic)\n"
+    "<b>/flash</b> — reflashe le firmware Arduino (~1 min)\n"
+    "<b>/logs</b> [bot|sensors|deploy] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
+    "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"
+    "<pre>/logs                       (15 dernières lignes du bot)\n"
+    "/logs sensors 50           (50 dernières lignes)\n"
+    "/logs bot 2h               (2 dernières heures)\n"
+    "/logs deploy since 10:00 until 11:00</pre>"
+)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List the available commands, tailored to the caller's role."""
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id) or {}
+
+    text = HELP_GENERAL
+    if user.get("role") == "admin" and not user.get("banned"):
+        text += HELP_ADMIN
+    await update.message.reply_text(text, parse_mode="HTML")
+
 async def graphe24h(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_graph(update, context, "-24h", "Historique 24 heures", autoscale_y=True)
 
@@ -434,6 +474,7 @@ application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
 application.add_handler(CommandHandler("echantillons", samples))
 application.add_handler(CommandHandler("flash", flash))
+application.add_handler(CommandHandler("help", help_command))
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")
