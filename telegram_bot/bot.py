@@ -2,9 +2,13 @@
 # -------------------------------------------------------------------------------------------------
 # IMPORTS
 import os
+import re
+import io
 import sys
+import html
 import asyncio
 import logging
+import datetime
 import subprocess
 
 from telegram import Update
@@ -56,8 +60,47 @@ LOG_UNITS = {
     "sensors": "sensors.service",
     "deploy": "deploy.service",
 }
-LOG_DEFAULT_LINES = 40
-LOG_MAX_LINES = 100
+LOG_DEFAULT_LINES = 15   # compact default tail when no line count / time range is given
+LOG_MESSAGE_MAX_LINES = 15  # above this many lines, deliver as a .txt file instead of a message
+
+## Secret env values that must never reach Telegram in a /logs dump.
+LOG_SECRET_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN", "INFLUXDB_TOKEN",
+    "TELEGRAM_PASSWORD_ADMIN", "TELEGRAM_PASSWORD_VIEWER",
+)
+
+def redact_secrets(text):
+    """Strip known/likely secrets from journal text before it is sent to Telegram.
+
+    Logs can contain the bot token (httpx URLs) or the InfluxDB token (a client traceback),
+    which must never leave the Pi. We replace the exact secret values we hold at runtime, plus
+    two token-shaped patterns as defense in depth. This is a strong mitigation, not a proof:
+    it cannot catch an unknown secret embedded in arbitrary third-party output.
+    """
+    for var in LOG_SECRET_ENV_VARS:
+        value = os.getenv(var)
+        if value:
+            text = text.replace(value, "***")
+    # Telegram bot-token shape (<digits>:<35+ url-safe chars>) and token=... query params.
+    text = re.sub(r"\b\d{6,10}:[A-Za-z0-9_-]{30,}\b", "***", text)
+    text = re.sub(r"(?i)(token=)[^&\s]+", r"\1***", text)
+    return text
+
+def build_logs_payload(output, unit_alias, header):
+    """Decide how to deliver a journal tail to Telegram.
+
+    Returns either {'kind': 'message', 'text': <html>} for a compact tail, or
+    {'kind': 'file', 'data': bytes, 'filename': str, 'caption': str} otherwise. A message is
+    kept compact — at most LOG_MESSAGE_MAX_LINES lines and within Telegram's 4096-char cap
+    (checked on the escaped+tagged text so '<'/'&'/'>' can't break parsing or overflow);
+    anything larger is sent as a .txt file.
+    """
+    body = f"<b>{html.escape(header)}</b>\n<pre>{html.escape(output)}</pre>"
+    if len(output.splitlines()) <= LOG_MESSAGE_MAX_LINES and len(body) <= 4096:
+        return {"kind": "message", "text": body}
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    return {"kind": "file", "data": output.encode("utf-8"),
+            "filename": f"{unit_alias}_{stamp}.log", "caption": header}
 
 # -------------------------------------------------------------------------------------------------
 # STARTUP CHECK
@@ -298,25 +341,57 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admin only.")
         return
 
+    usage = (f"Usage: /logs [{'|'.join(LOG_UNITS)}] [N | 2h|30m|3d] "
+             "[since <t>] [until <t>]")
+
+    # Order-independent tokens: a unit alias, a bare integer (line count), a duration like
+    # 2h/30m/3d (relative window), or `since`/`until` each followed by a time token.
     unit_alias = "bot"
     lines = LOG_DEFAULT_LINES
-    for arg in context.args:
-        if arg.lower() in LOG_UNITS:
-            unit_alias = arg.lower()
+    since = until = None
+    args = list(context.args)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        low = arg.lower()
+        if low in LOG_UNITS:
+            unit_alias = low
         elif arg.isdigit():
-            lines = min(int(arg), LOG_MAX_LINES)
+            lines = int(arg)
+        elif re.fullmatch(r"\d+[smhd]", low):
+            since = f"-{low}"  # systemd reads "-2h" as "2 hours ago"; s/m/h/d = sec/min/hour/day
+        elif low in ("since", "until") and i + 1 < len(args):
+            i += 1
+            value = args[i]
+            # A bare duration means "ago"; otherwise pass the token through (HH:MM, YYYY-MM-DD…).
+            value = f"-{value.lower()}" if re.fullmatch(r"\d+[smhd]", value.lower()) else value
+            if low == "since":
+                since = value
+            else:
+                until = value
         else:
-            await update.message.reply_text(
-                f"Usage: /logs [{'|'.join(LOG_UNITS)}] [lines]"
-            )
+            await update.message.reply_text(usage)
             return
+        i += 1
+
+    # Build the argument list (no shell → --since/--until values can't inject). A time range
+    # shows the whole window; otherwise fall back to the last `lines` entries.
+    cmd = ["journalctl", "-u", LOG_UNITS[unit_alias], "--no-pager", "--no-hostname",
+           "-o", "short-iso"]
+    if since or until:
+        if since:
+            cmd += ["--since", since]
+        if until:
+            cmd += ["--until", until]
+        window = " → ".join(x for x in (since, until) if x) if (since and until) else (since or until)
+        header = f"{LOG_UNITS[unit_alias]} — {window}"
+    else:
+        cmd += ["-n", str(lines)]
+        header = f"{LOG_UNITS[unit_alias]} — last {lines} lines"
 
     try:
         result = await asyncio.to_thread(
-            subprocess.run,
-            ["journalctl", "-u", LOG_UNITS[unit_alias], "-n", str(lines),
-             "--no-pager", "-o", "short-iso"],
-            capture_output=True, text=True, timeout=15,
+            subprocess.run, cmd, capture_output=True, text=True, timeout=15,
         )
         # On permission problems journalctl often exits 0 with a hint on stderr;
         # show whatever it produced, it is the diagnostic.
@@ -326,11 +401,16 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Could not read journal: {e}")
         return
 
-    # Telegram caps messages at 4096 chars; send the most recent chunks as plain
-    # text (no Markdown parse mode: journal content would break entity parsing).
-    chunks = [output[i:i + 4000] for i in range(0, len(output), 4000)]
-    for chunk in chunks[-3:]:
-        await update.message.reply_text(chunk)
+    # Strip secrets, then render: a monospace message if it fits, else a .txt file attachment.
+    output = redact_secrets(output)
+    payload = build_logs_payload(output, unit_alias, header)
+    if payload["kind"] == "message":
+        await update.message.reply_text(payload["text"], parse_mode="HTML")
+    else:
+        buf = io.BytesIO(payload["data"])
+        buf.name = payload["filename"]
+        await update.message.reply_document(
+            document=buf, filename=payload["filename"], caption=payload["caption"])
 
 async def graphe24h(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_graph(update, context, "-24h", "Historique 24 heures", autoscale_y=True)

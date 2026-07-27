@@ -30,7 +30,20 @@ journal owns retention. Lines are formatted `LEVEL [module] message`; journald a
 timestamp. Set `LOG_LEVEL` in `.env` (default `INFO`) to change verbosity without a code change.
 
 Read logs on the Pi with `journalctl -u <unit>`, or remotely (admin only) via the Telegram
-`/logs [bot|sensors|deploy] [lines]` command.
+`/logs` command:
+
+```
+/logs [bot|sensors|deploy] [N | 2h|30m|3d] [since <t>] [until <t>]
+```
+
+- No argument → the last 15 lines of `telegram-bot.service` (a compact message).
+- `N` → last N lines (no upper cap). `2h`/`30m`/`3d` → a relative window (last 2 hours, etc.).
+- `since <t>` / `until <t>` → an explicit range; `<t>` is a single token: `HH:MM`,
+  `YYYY-MM-DD`, `today`/`yesterday`, or a duration like `2h` (meaning "ago").
+
+Output is **redacted** of known secrets (bot/InfluxDB tokens) before sending. A compact result
+(≤ 15 lines) is rendered as a monospace message; anything larger is sent as a `.txt` file
+attachment (no truncation).
 
 **InfluxDB records only serious events** (the DB is for managing the project; the Telegram bot
 is an add-on and never writes to it):
