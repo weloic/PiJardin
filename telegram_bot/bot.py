@@ -54,6 +54,24 @@ PASSWORD_TO_ROLE = {
 
 MAX_FAILED_ATTEMPTS = 10
 
+## What to tell the user for each firmware error code (the contract lives in read_puit.py).
+## The split that matters here is "try again in a minute" vs "someone has to go to the well"
+## vs "this is our bug" — the sensor is fine in only one of the three.
+SENSOR_ERROR_FR = {
+    'echo_timeout':         "Le capteur n'a reçu aucun écho (surface agitée ou oblique). "
+                            "Réessayez dans un instant.",
+    'insufficient_samples': "Trop peu de mesures valides pour être fiable. "
+                            "Réessayez dans un instant.",
+    'no_reply':             "L'Arduino n'a pas répondu. Réessayez ; si cela persiste, /flash.",
+    'out_of_range':         "Le capteur répond mais toutes les mesures sont hors plage : "
+                            "probablement mal orienté ou obstrué. Intervention nécessaire au puits.",
+    'sensor_fault':         "Le capteur ne réagit plus au déclenchement : alimentation, câblage "
+                            "ou module HS. Intervention nécessaire au puits.",
+    'proto_mismatch':       "Le firmware de l'Arduino ne correspond pas au logiciel du Pi. "
+                            "Un admin doit lancer /flash.",
+    'no_banner':            "L'Arduino ne démarre pas correctement. Un admin doit lancer /flash.",
+}
+
 ## Journal units readable via /logs — fixed whitelist, never user-supplied unit names.
 LOG_UNITS = {
     "bot": "telegram-bot.service",
@@ -216,13 +234,15 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TimeoutError:
         await msg.edit_text("Une mesure ordinaire est déjà en cours, veuillez recommencer plus tard")
         return
+    except read_puit.PuitError as e:
+        # The firmware says *why* it could not measure; relay that instead of a generic
+        # failure, since what the user should do about it differs per code.
+        log.warning(f"/mesure failed for chat {chat_id}: {e}")
+        await msg.edit_text(f"❌ {SENSOR_ERROR_FR.get(e.code, f'Mesure impossible ({e.code}).')}")
+        return
     except Exception as e:
         log.warning(f"/mesure failed for chat {chat_id}: {e}")
         await msg.edit_text(f"Measurement failed: {e}")
-        return
-
-    if height is None:
-        await msg.edit_text("Sensor did not return a valid reading.")
         return
 
     volume = read_puit.height_to_volume(height)
@@ -264,8 +284,42 @@ async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_s
     await update.message.reply_photo(photo=png, caption=title)
     await msg.delete()
 
+def format_sampling(resp):
+    """Render a `sampling` burst as a diagnostic block.
+
+    Works on a failed burst too: the four counts and the effective parameters are on every
+    measurement reply, and they are what says whether the sensor is silent, blind, or aimed
+    at the wrong thing. The per-ping detail only exists on a successful one.
+    """
+    lines = []
+    if resp.get('status') == 'ok':
+        lines.append(f"Médiane : {resp['value']:.1f} cm  "
+                     f"(min {resp['min']:.1f} / max {resp['max']:.1f}, "
+                     f"écart {resp['spread']:.1f})")
+    else:
+        lines.append(f"Échec : {resp.get('code', '?')}"
+                     + (f" (champ {resp['field']})" if 'field' in resp else ""))
+
+    lines.append(f"Pings : {resp.get('n_valid')} valides · {resp.get('n_timeout')} sans écho · "
+                 f"{resp.get('n_rejected')} hors plage · {resp.get('n_no_response')} sans réponse "
+                 f"(sur {resp.get('n')})")
+    if resp.get('ping_status'):
+        lines.append(f"Détail : {resp['ping_status']}   "
+                     "(V valide · R hors plage · T sans écho · N sans réponse)")
+
+    samples_cm = resp.get('samples')
+    if isinstance(samples_cm, list):
+        lines.append("cm : " + ", ".join('—' if s is None else f"{s:.1f}" for s in samples_cm))
+    pulses = resp.get('pulse_us')
+    if isinstance(pulses, list):
+        lines.append("µs : " + ", ".join('—' if p is None else f"{p:.0f}" for p in pulses))
+
+    lines.append(f"Fenêtre {resp.get('min_cm')}–{resp.get('max_cm')} cm · {resp.get('temp_c')} °C · "
+                 f"timeout {resp.get('timeout_us')} µs")
+    return "\n".join(lines)
+
 async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Relay the Arduino's raw ping array (SAMPLING) — admin sensor diagnostics."""
+    """Relay one `sampling` burst, per ping — admin sensor diagnostics."""
     chat_id = str(update.effective_chat.id)
     user = load_users().get(chat_id)
 
@@ -276,20 +330,23 @@ async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("Lecture des échantillons bruts, patience")
 
     try:
-        raw = await asyncio.to_thread(read_puit.raw_samples_once, 20)
+        resp = await asyncio.to_thread(read_puit.raw_samples_once, 20)
     except TimeoutError:
         await msg.edit_text("Une mesure ordinaire est déjà en cours, veuillez recommencer plus tard")
+        return
+    except read_puit.PuitError as e:
+        # A failed burst is a diagnostic result, not an error to swallow: show the counts
+        # the board reported (they are on every measurement reply) when we have them.
+        log.warning(f"/echantillons failed for chat {chat_id}: {e}")
+        detail = format_sampling(e.resp) if e.resp.get('n') is not None else str(e)
+        await msg.edit_text(f"❌ {SENSOR_ERROR_FR.get(e.code, f'Échec ({e.code}).')}\n\n{detail}")
         return
     except Exception as e:
         log.warning(f"/echantillons failed for chat {chat_id}: {e}")
         await msg.edit_text(f"Sampling failed: {e}")
         return
 
-    if raw is None:
-        await msg.edit_text("Le capteur n'a pas répondu.")
-        return
-
-    await msg.edit_text(f"Échantillons bruts (cm) :\n{raw}")
+    await msg.edit_text(format_sampling(resp))
 
 async def flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Flash the committed firmware.bin onto the Arduino — admin-only ops action.
@@ -432,7 +489,8 @@ HELP_GENERAL = (
 
 HELP_ADMIN = (
     "\n<b>Admin</b>\n"
-    "<b>/echantillons</b> — mesures brutes du capteur (diagnostic)\n"
+    "<b>/echantillons</b> — un tir de mesures ping par ping : médiane, compteurs "
+    "(valides / sans écho / hors plage / sans réponse) et détail (diagnostic capteur)\n"
     "<b>/flash</b> — reflashe le firmware Arduino (~1 min)\n"
     "<b>/logs</b> [bot|sensors|deploy] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
     "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"

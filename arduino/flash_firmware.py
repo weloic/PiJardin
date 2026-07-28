@@ -123,8 +123,9 @@ def verify_firmware(attempts=3, settle=2.0):
     The `bossac -R` reset re-enumerates the USB device: for a second or two the node
     can be absent, or present but still tearing down (open → Errno 32 Broken pipe).
     So retry a few times with a settle delay before giving up. Reuses open_arduino()
-    (DTR reset + waits for the 'Started serial com' banner) and get_sensor_data(); a
-    float back means the firmware speaks READ_PUIT."""
+    (DTR reset + waits for the JSON ready banner, which also checks `proto`) and
+    get_sensor_data(); a reading back means the image we just wrote speaks the protocol
+    this Pi expects — a mismatched firmware fails the handshake instead."""
     for attempt in range(1, attempts + 1):
         time.sleep(settle)
         if not os.path.exists(PORT):
@@ -134,6 +135,11 @@ def verify_firmware(attempts=3, settle=2.0):
             arduino = read_puit.open_arduino()
         except (serial.SerialException, OSError) as e:
             log.warning(f"Verify attempt {attempt}/{attempts}: could not open {PORT}: {e}")
+            continue
+        except read_puit.PuitError as e:
+            # Wrong or stale firmware, or a board that never came back up: report it as a
+            # failed verification rather than a traceback out of the flash script.
+            log.warning(f"Verify attempt {attempt}/{attempts}: no valid handshake: {e}")
             continue
         try:
             reading = read_puit.get_sensor_data(arduino, retries=3)
