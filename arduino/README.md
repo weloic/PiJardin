@@ -7,6 +7,8 @@ onto the Pi's Arduino remotely — no SSH, no physical access.
 ```
 arduino/
 ├── firmware.bin        # prebuilt image (committed; absent until the first real firmware)
+├── firmware_v1.bin     # previous image, kept for a manual rollback (proto 1 — needs the
+│                       #   matching read_puit.py, so it is not a drop-in downgrade)
 ├── VERSION             # version / source_commit / built — bump on every firmware change
 ├── flash_firmware.py   # flashes firmware.bin onto /dev/ttyACM0 via bossac
 └── README.md           # this file

@@ -1,5 +1,5 @@
 # Metadata for the committed firmware.bin. Read by flash_firmware.py (version=)
 # and reported on a successful flash. Bump this whenever firmware.bin changes.
-version=1.0
+version=2.0
 source_commit=none
-built=2026-07-24
+built=2026-07-29
