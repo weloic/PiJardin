@@ -9,8 +9,12 @@ cd "$REPO_DIR"
 
 # Capture current HEAD before pulling
 OLD=$(git rev-parse HEAD)
-git fetch origin main --quiet
-git reset --hard origin/main
+# TEMP (dev test): tracking v2_arduino instead of main. Revert this commit to send
+# the Pi back to main -- and revert it before merging this branch into main, or main
+# would point at v2_arduino too. Bare `fetch origin` so origin/v2_arduino exists on
+# a Pi that has only ever fetched main.
+git fetch origin --quiet
+git reset --hard origin/v2_arduino
 NEW=$(git rev-parse HEAD)
 
 if [ "$OLD" = "$NEW" ]; then
