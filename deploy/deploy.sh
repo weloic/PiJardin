@@ -9,8 +9,13 @@ cd "$REPO_DIR"
 
 # Capture current HEAD before pulling
 OLD=$(git rev-parse HEAD)
-git fetch origin main --quiet
-git reset --hard origin/main
+# TEMP (dev test): one-shot hand-off to v2_arduino. The Pi runs the deploy.sh already
+# on its disk, so this tick only installs the pointer -- the next tick reads it and
+# moves the checkout. Revert this commit once the Pi has moved; v2_arduino carries its
+# own pointer from there. Bare `fetch origin` so origin/v2_arduino exists on a Pi that
+# has only ever fetched main.
+git fetch origin --quiet
+git reset --hard origin/v2_arduino
 NEW=$(git rev-parse HEAD)
 
 if [ "$OLD" = "$NEW" ]; then
