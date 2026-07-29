@@ -15,7 +15,7 @@ OLD=$(git rev-parse HEAD)
 # own pointer from there. Bare `fetch origin` so origin/v2_arduino exists on a Pi that
 # has only ever fetched main.
 git fetch origin --quiet
-git reset --hard origin/main
+git reset --hard origin/v2_arduino
 NEW=$(git rev-parse HEAD)
 
 if [ "$OLD" = "$NEW" ]; then
