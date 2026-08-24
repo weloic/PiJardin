@@ -57,8 +57,19 @@ BAUD_RATE = 9600
 ## discovered from the board: it echoes the effective value of every parameter it used.
 PROTO = 2                       # must match the firmware; bumped only by a breaking change
 LINE_MAX = 192                  # longest request line the board accepts, bytes
+MAX_N = 25                      # most pings per burst; the board clamps anything above it
 N_DEFAULT = 10                  # pings per burst, board-side default
 TIMEOUT_DEFAULT_US = 45000      # per-ping echo timeout, board-side default
+ACK_TIMEOUT_DEFAULT_US = 50000  # per-ping wait for echo to *rise*, board-side default
+PING_GAP_S = 0.003              # the firmware's delay(3) between pings
+
+## ack_max_us is the module's measured trigger->rise latency, and ack_timeout_us the deadline
+## it is judged against — the one bound in the measurement path with no physical ground truth
+## behind it. Warn once the former reaches this fraction of the latter: a module getting
+## slower crosses the deadline eventually, and past that point the firmware reports perfectly
+## healthy hardware as a dead sensor. (Measured on the fitted module: 12.3 ms against a
+## 50 ms deadline, i.e. 25%.)
+ACK_MARGIN_WARN = 0.5
 
 ## A physical sensor fault does not clear on its own and is not retried, but the scheduled
 ## run fires every 5 minutes — throttle the admin notification per error code.
@@ -193,12 +204,28 @@ def _read_json_object(arduino, deadline):
 
 
 def _burst_timeout(cmd, params):
-    """How long to wait for a reply: the worst case of every ping in the burst timing out."""
+    """How long to wait for a reply: the worst case of every ping in the burst failing.
+
+    Sized against the slowest burst, never against a good reading. A healthy burst is back in
+    well under a second, but one where the sensor answers and then finds nothing spends the
+    full echo timeout on every ping, and one where nothing answers at all spends the full
+    rise deadline instead. Too short a deadline here turns a carefully diagnosed sensor_fault
+    into a generic no_reply — throwing the diagnosis away at exactly the moment it matters,
+    and blaming the link for what the firmware had correctly identified as the sensor.
+
+    Both per-ping waits are counted even though a single ping can only hit one of them: which
+    one it hits varies within a burst, so only their sum is a safe bound. At the defaults that
+    is ~3.0 s for a 10-ping burst and ~4.5 s for 25.
+    """
     if cmd == 'status':
         return 2.0
-    n = params.get('n') or N_DEFAULT
-    timeout_us = params.get('timeout_us') or TIMEOUT_DEFAULT_US
-    return 2.0 + n * (timeout_us / 1e6 + 0.02)
+    # Bound by what the board will actually do, not by what we asked for: out-of-range
+    # parameters are clamped rather than rejected, so n=999 is 25 pings — and without the
+    # clamp here, a typo in a diagnostic would strand the caller for minutes.
+    n = min(params.get('n') or N_DEFAULT, MAX_N)
+    timeout_us = min(params.get('timeout_us') or TIMEOUT_DEFAULT_US, 60000)
+    ack_timeout_us = min(params.get('ack_timeout_us') or ACK_TIMEOUT_DEFAULT_US, 60000)
+    return 2.0 + n * ((timeout_us + ack_timeout_us) / 1e6 + PING_GAP_S)
 
 
 def request(arduino, cmd, timeout=None, **params):
@@ -263,7 +290,21 @@ def describe_counts(resp):
     """
     parts = [f"n={resp.get('n', '?')}"]
     parts += [f"{field[2:]}={resp.get(field, '?')}"
-              for field in ('n_valid', 'n_timeout', 'n_rejected', 'n_no_response')]
+              for field in ('n_valid', 'n_timeout', 'n_rejected')]
+
+    # n_stuck is a subset of n_no_response, never a fifth bucket, so it is rendered inside
+    # it — the four buckets have to keep visibly summing to n. Shown only when non-zero:
+    # zero is the healthy case, and it is absent altogether on firmware before 2.1.0.
+    no_response = f"no_response={resp.get('n_no_response', '?')}"
+    if resp.get('n_stuck'):
+        no_response += f"(stuck={resp['n_stuck']})"
+    parts.append(no_response)
+
+    # Reported against the window it is judged against, so the one assumption in the
+    # measurement path with no physical ground truth behind it is never invisible again.
+    if resp.get('ack_max_us') is not None:
+        parts.append(f"ack_max={resp['ack_max_us']}/{resp.get('ack_timeout_us', '?')}µs")
+
     if resp.get('ping_status'):
         parts.append(resp['ping_status'])
     return ' '.join(parts)
@@ -281,11 +322,40 @@ def log_burst_health(resp):
     no-response is unambiguous.)
     """
     if resp.get('n_no_response'):
-        log.warning(f"Sensor ignored {resp['n_no_response']} trigger(s) — check power and "
-                    f"wiring [{describe_counts(resp)}]")
+        # n_stuck splits this into the two wiring faults it can be, at opposite ends of the
+        # harness — see _sensor_fault_text() for why the distinction is worth carrying.
+        side = ("echo held high, so no trigger was even fired — check the echo line (D7)"
+                if resp.get('n_stuck') else "check power, the module, and the trigger line")
+        log.warning(f"Sensor ignored {resp['n_no_response']} trigger(s) — {side} "
+                    f"[{describe_counts(resp)}]")
     elif resp.get('n_valid', 0) < resp.get('n', 0):
         log.info(f"Lost {resp['n'] - resp['n_valid']} ping(s) to the environment "
                  f"[{describe_counts(resp)}]")
+
+    _log_ack_margin(resp)
+
+
+def _log_ack_margin(resp):
+    """Warn when the module's reaction time is closing on the deadline it is judged against.
+
+    ack_max_us is not a fault signal in itself — it is how long the module took to react, and
+    it is worth watching because the deadline above it is the only bound here derived from a
+    datasheet rather than from physics. A module going soft drifts upward for weeks, and the
+    moment it crosses ack_timeout_us the firmware starts reporting healthy hardware as a dead
+    sensor, with a code that says "unpowered, dead, or a wire off" and sends someone to the
+    well. Catching the drift is far cheaper than diagnosing that alert. Trend it in Grafana
+    too — the field is recorded on every point.
+    """
+    ack_max = resp.get('ack_max_us')
+    window = resp.get('ack_timeout_us')
+    # 0 means nothing answered (there is no latency to report); absent means fw < 2.1.0.
+    if not ack_max or not window:
+        return
+    if ack_max > ACK_MARGIN_WARN * window:
+        log.warning(f"Sensor took {ack_max} µs to answer a trigger — over "
+                    f"{ACK_MARGIN_WARN:.0%} of the {window} µs deadline. A module that keeps "
+                    f"slowing down will start being reported as dead hardware; re-measure "
+                    f"with /echantillons and raise ack_timeout_us in the firmware.")
 
 
 def measure(arduino, cmd='read_puit', retries=3, delay=0.5, **params):
@@ -406,8 +476,50 @@ def save_previous_measure(height):
     state['previous_measure'] = height
     save_state(state)
 
+def fault_alert_key(error):
+    """Throttle slot for a fault alert: the code, plus which wiring fault it turned out to be.
+
+    The two sensor_fault flavours get separate slots on purpose. They share a code but send
+    someone to opposite ends of the harness, so if an echo-line fault is repaired and a
+    trigger-side one appears an hour later, the second must not be swallowed by the first
+    one's 6 h throttle.
+    """
+    if error.code != 'sensor_fault':
+        return error.code
+    stuck = error.resp.get('n_stuck')
+    if stuck is None:
+        return error.code                       # fw < 2.1.0: undifferentiated, one slot
+    return f"{error.code}:{'stuck' if stuck else 'no_ack'}"
+
+
+def _sensor_fault_text(resp):
+    """The sensor_fault message, split by which end of the wiring to go and look at.
+
+    n_stuck > 0 means echo was already HIGH when the ping began, so the trigger was never
+    fired at all: the fault is on the echo line — held high, miswired, a damaged input.
+    n_stuck == 0 means triggers did go out and nothing ever came back: power, the module, or
+    the trigger line. Both are critical and neither is retried, but they are opposite ends of
+    the harness, so an alert that does not say which wastes the trip.
+
+    A board on firmware before 2.1.0 does not report n_stuck at all. Say so rather than
+    assuming zero: guessing here would send someone confidently to the wrong wire, which is
+    the same unearned certainty the firmware added these fields to remove.
+    """
+    tail = "Aucune mesure n'est enregistrée jusqu'à réparation."
+    stuck = resp.get('n_stuck')
+    if stuck is None:
+        return ("🚨 Puit : le capteur ne répond plus au déclenchement — alimentation, câblage "
+                f"ou module HS. {tail}")
+    if stuck:
+        return ("🚨 Puit : la ligne echo reste haute — aucun déclenchement n'a même été émis. "
+                "À vérifier côté echo (D7) : câble, adaptateur de niveau, entrée endommagée. "
+                f"{tail}")
+    return ("🚨 Puit : les déclenchements sont émis mais le capteur ne répond jamais — "
+            f"alimentation, module HS, ou ligne trigger (D8). {tail}")
+
+
 def notify_sensor_fault(error):
-    """Tell the admins the sensor needs physical attention — at most once per code per 6 h.
+    """Tell the admins the sensor needs physical attention — at most once per fault per 6 h.
 
     Only for the two codes that are never retried and will not clear by themselves. The
     throttle is the point: the scheduled run fires every 5 minutes, so the same dead sensor
@@ -416,16 +528,21 @@ def notify_sensor_fault(error):
     state = load_state()
     sent = state.get('fault_alerts') or {}
     now = time.time()
-    last = sent.get(error.code)
+    key = fault_alert_key(error)
+    last = sent.get(key)
     if isinstance(last, (int, float)) and now - last < FAULT_ALERT_INTERVAL_S:
-        log.info(f"Fault alert for {error.code} already sent {(now - last) / 3600:.1f} h ago; "
+        log.info(f"Fault alert for {key} already sent {(now - last) / 3600:.1f} h ago; "
                  "not repeating.")
         return
 
     detail = describe_counts(error.resp) if error.resp else str(error)
     if error.code == 'sensor_fault':
-        text = ("🚨 Puit : le capteur ne répond plus au déclenchement — alimentation, câblage "
-                "ou module HS. Aucune mesure n'est enregistrée jusqu'à réparation.")
+        text = _sensor_fault_text(error.resp)
+        # Spelled out even when zero, unlike in the log line: these are the two numbers that
+        # turn "go look at the well" into "go look at the echo wire", and an ack_max_us of 0
+        # confirms nothing answered at all rather than answering just outside the window.
+        detail += (f"\nn_stuck={error.resp.get('n_stuck', 'n/a')} · "
+                   f"ack_max_us={error.resp.get('ack_max_us', 'n/a')}")
     else:
         text = ("🚨 Puit : le capteur répond mais toutes les mesures sont hors plage — "
                 "probablement mal orienté ou obstrué (support, paroi, surface).")
@@ -435,7 +552,7 @@ def notify_sensor_fault(error):
         log.error(f"Could not notify admins of {error.code}: {e}")
         return          # not recorded as sent, so the next run tries again
 
-    sent[error.code] = now
+    sent[key] = now
     state['fault_alerts'] = sent
     save_state(state)
 
@@ -494,9 +611,16 @@ def write_service_failure(unit):
 ## so storing both means a future correction to the µs->cm divisor can be replayed over
 ## everything already recorded. The counts make a sensor degrading over weeks visible as a
 ## graph (n_valid/n) instead of as a surprise the morning it dies.
+##
+## n_stuck and ack_max_us arrive with fw 2.1.0 and are simply absent on an older board — the
+## loop below skips whatever is missing, so this stays compatible either way. ack_max_us is
+## the one to graph next to n_valid/n: it is the module's reaction time, and its upward trend
+## is both an early warning of a dying module and a prediction of when the firmware will
+## begin reporting a live sensor as dead.
 MEASUREMENT_FIELDS = (
     ('pulse_us', float), ('temp_c', float),
     ('n', int), ('n_valid', int), ('n_timeout', int), ('n_rejected', int), ('n_no_response', int),
+    ('n_stuck', int), ('ack_max_us', int),
 )
 
 def write_influx_measurement(heigth_median, resampled=False, resp=None):
@@ -643,19 +767,30 @@ def measure_once(lock_timeout=0):
     return _with_arduino(lock_timeout, collect_puit_data)
 
 
-def raw_samples_once(lock_timeout=0, n=None):
+def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):
     """Ask the Arduino for one `sampling` burst — per-ping detail, diagnostics only.
 
     Returns the response dict: the same statistics as a measurement plus index-aligned
-    `samples`/`pulse_us` arrays and `ping_status`, one character per ping. That last field
-    is the only per-ping way to tell a sensor that answered but saw nothing (T) from one
-    that ignored the trigger (N) — both are null in the arrays.
+    `samples`/`pulse_us`/`ack_us` arrays and `ping_status`, one character per ping. That last
+    field is the only per-ping way to tell a sensor that answered but saw nothing (T) from one
+    that ignored the trigger (N) or never got one (S) — all three are null in `samples`.
+    `ack_us` follows a different null rule and separates T from N/S on its own: it holds a
+    latency for every ping the module engaged with, including the timeouts, so a null pulse
+    beside a real ack reads as "answered, found nothing" — a sensor returning no data that is
+    nonetheless alive.
+
+    `ack_timeout_us` (500–60000, default 50000) widens the per-ping wait for echo to rise.
+    That is the diagnostic for a suspicious sensor_fault: if a burst reporting
+    n_no_response == n comes back valid at a wider window, the window was the fault and the
+    sensor was never broken — which is exactly what the firmware's original 2 ms deadline did
+    to a healthy module that takes 12.3 ms.
 
     Not retried: a diagnostic wants the failure it actually got. Raises PuitError (with the
     failing response on `.resp`) if the burst failed, TimeoutError like measure_once.
     """
     def action(arduino):
-        resp = measure(arduino, cmd='sampling', retries=1, n=n)
+        resp = measure(arduino, cmd='sampling', retries=1, n=n,
+                       ack_timeout_us=ack_timeout_us)
         log_burst_health(resp)
         return resp
 

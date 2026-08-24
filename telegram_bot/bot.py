@@ -72,6 +72,26 @@ SENSOR_ERROR_FR = {
     'no_banner':            "L'Arduino ne démarre pas correctement. Un admin doit lancer /flash.",
 }
 
+## sensor_fault covers two faults at opposite ends of the wiring, told apart by n_stuck: echo
+## held high means the trigger was never even fired (echo side), no stuck pings means triggers
+## went out and nothing answered (power / module / trigger side). Keyed by whether n_stuck is
+## non-zero; absent (firmware before 2.1.0) falls back to the undifferentiated text above
+## rather than guessing a side.
+SENSOR_FAULT_FR = {
+    True:  "La ligne echo reste haute : aucun déclenchement n'est émis. À vérifier côté "
+           "echo (D7). Intervention nécessaire au puits.",
+    False: "Les déclenchements sont émis mais le capteur ne répond jamais : alimentation, "
+           "module HS ou ligne trigger (D8). Intervention nécessaire au puits.",
+}
+
+def sensor_error_text(error):
+    """The French explanation for a PuitError, refined by the response when it says more."""
+    if error.code == 'sensor_fault':
+        stuck = error.resp.get('n_stuck')
+        if stuck is not None:
+            return SENSOR_FAULT_FR[bool(stuck)]
+    return SENSOR_ERROR_FR.get(error.code, f"Mesure impossible ({error.code}).")
+
 ## Journal units readable via /logs — fixed whitelist, never user-supplied unit names.
 LOG_UNITS = {
     "bot": "telegram-bot.service",
@@ -238,7 +258,7 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # The firmware says *why* it could not measure; relay that instead of a generic
         # failure, since what the user should do about it differs per code.
         log.warning(f"/mesure failed for chat {chat_id}: {e}")
-        await msg.edit_text(f"❌ {SENSOR_ERROR_FR.get(e.code, f'Mesure impossible ({e.code}).')}")
+        await msg.edit_text(f"❌ {sensor_error_text(e)}")
         return
     except Exception as e:
         log.warning(f"/mesure failed for chat {chat_id}: {e}")
@@ -300,12 +320,17 @@ def format_sampling(resp):
         lines.append(f"Échec : {resp.get('code', '?')}"
                      + (f" (champ {resp['field']})" if 'field' in resp else ""))
 
+    # n_stuck is a subset of "sans réponse", not a fifth bucket, so it is shown inside it —
+    # the four counts must still visibly add up to n.
+    no_response = f"{resp.get('n_no_response')} sans réponse"
+    if resp.get('n_stuck'):
+        no_response += f" (dont {resp['n_stuck']} bloqué{'s' if resp['n_stuck'] > 1 else ''})"
     lines.append(f"Pings : {resp.get('n_valid')} valides · {resp.get('n_timeout')} sans écho · "
-                 f"{resp.get('n_rejected')} hors plage · {resp.get('n_no_response')} sans réponse "
-                 f"(sur {resp.get('n')})")
+                 f"{resp.get('n_rejected')} hors plage · {no_response} (sur {resp.get('n')})")
     if resp.get('ping_status'):
         lines.append(f"Détail : {resp['ping_status']}   "
-                     "(V valide · R hors plage · T sans écho · N sans réponse)")
+                     "(V valide · R hors plage · T sans écho · N sans réponse · "
+                     "S echo bloqué haut)")
 
     samples_cm = resp.get('samples')
     if isinstance(samples_cm, list):
@@ -313,9 +338,18 @@ def format_sampling(resp):
     pulses = resp.get('pulse_us')
     if isinstance(pulses, list):
         lines.append("µs : " + ", ".join('—' if p is None else f"{p:.0f}" for p in pulses))
+    # Present for the T pings too, unlike the two arrays above: a dash in µs beside a number
+    # here reads as "le module a répondu, mais n'a rien vu" — no data, yet alive.
+    acks = resp.get('ack_us')
+    if isinstance(acks, list):
+        lines.append("ack µs : " + ", ".join('—' if a is None else f"{a:.0f}" for a in acks))
 
     lines.append(f"Fenêtre {resp.get('min_cm')}–{resp.get('max_cm')} cm · {resp.get('temp_c')} °C · "
                  f"timeout {resp.get('timeout_us')} µs")
+    # The module's reaction time against the deadline it is judged by. Absent before fw 2.1.0.
+    if resp.get('ack_max_us') is not None:
+        lines.append(f"Réaction : {resp['ack_max_us']} µs max "
+                     f"(limite {resp.get('ack_timeout_us')} µs)")
     return "\n".join(lines)
 
 async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,10 +361,30 @@ async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admin only.")
         return
 
+    # Order-independent tokens: a bare integer is the ping count, `ack <µs>` widens the wait
+    # for echo to rise. Both are passed through unvalidated on purpose — the board clamps out
+    # of range values and echoes what it actually used, so a clamp shows up in the reply
+    # instead of being argued about here.
+    usage = "Usage: /echantillons [N] [ack <µs>]"
+    n = ack_timeout_us = None
+    args = list(context.args)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.isdigit():
+            n = int(arg)
+        elif arg.lower() == "ack" and i + 1 < len(args) and args[i + 1].isdigit():
+            i += 1
+            ack_timeout_us = int(args[i])
+        else:
+            await update.message.reply_text(usage)
+            return
+        i += 1
+
     msg = await update.message.reply_text("Lecture des échantillons bruts, patience")
 
     try:
-        resp = await asyncio.to_thread(read_puit.raw_samples_once, 20)
+        resp = await asyncio.to_thread(read_puit.raw_samples_once, 20, n, ack_timeout_us)
     except TimeoutError:
         await msg.edit_text("Une mesure ordinaire est déjà en cours, veuillez recommencer plus tard")
         return
@@ -339,7 +393,7 @@ async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # the board reported (they are on every measurement reply) when we have them.
         log.warning(f"/echantillons failed for chat {chat_id}: {e}")
         detail = format_sampling(e.resp) if e.resp.get('n') is not None else str(e)
-        await msg.edit_text(f"❌ {SENSOR_ERROR_FR.get(e.code, f'Échec ({e.code}).')}\n\n{detail}")
+        await msg.edit_text(f"❌ {sensor_error_text(e)}\n\n{detail}")
         return
     except Exception as e:
         log.warning(f"/echantillons failed for chat {chat_id}: {e}")
@@ -489,8 +543,15 @@ HELP_GENERAL = (
 
 HELP_ADMIN = (
     "\n<b>Admin</b>\n"
-    "<b>/echantillons</b> — un tir de mesures ping par ping : médiane, compteurs "
-    "(valides / sans écho / hors plage / sans réponse) et détail (diagnostic capteur)\n"
+    "<b>/echantillons</b> [N] [ack &lt;µs&gt;] — un tir de mesures ping par ping : médiane, "
+    "compteurs (valides / sans écho / hors plage / sans réponse, dont bloqués), détail par "
+    "ping et temps de réaction du module (diagnostic capteur)\n"
+    "<pre>/echantillons              (tir standard)\n"
+    "/echantillons 25           (25 pings)\n"
+    "/echantillons 5 ack 60000  (fenêtre de réaction élargie :\n"
+    "                            si un sensor_fault redevient\n"
+    "                            valide, c'est la fenêtre qui\n"
+    "                            était trop serrée, pas le capteur)</pre>"
     "<b>/flash</b> — reflashe le firmware Arduino (~1 min)\n"
     "<b>/logs</b> [bot|sensors|deploy] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
     "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"
