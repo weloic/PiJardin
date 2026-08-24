@@ -1,4 +1,5 @@
 .env
+arduino/older_firmware
 sensors/.puit_state.json
 sensors/.puit.lock
 telegram_bot/.telegram_users.json

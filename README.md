@@ -45,8 +45,16 @@ Output is **redacted** of known secrets (bot/InfluxDB tokens) before sending. A 
 (≤ 15 lines) is rendered as a monospace message; anything larger is sent as a `.txt` file
 attachment (no truncation).
 
-**InfluxDB records only serious events** (the DB is for managing the project; the Telegram bot
-is an add-on and never writes to it):
+**InfluxDB records the measurements plus only serious events** (the DB is for managing the
+project; the Telegram bot is an add-on and never writes to it):
+- **`height_measure` measurement** — one point per reading, timestamp rounded to 5 min, tag
+  `resampled`. Field `lenght_median` is the distance in cm the Grafana dashboards read; the
+  rest is health and future repair, all from the same burst: `pulse_us` (the raw echo width,
+  the only thing the board actually measures) and `temp_c` (the air temperature it was
+  converted with) make a later correction to the µs→cm divisor replayable over history, and
+  `n`/`n_valid`/`n_timeout`/`n_rejected`/`n_no_response` say how the burst went. Graphing
+  `n_valid / n` is the best early warning there is: a sensor on its way out trends down for
+  weeks before it fails outright.
 - **`log` measurement** — every `WARNING`+ from the scheduled `sensors.service` data path
   (`read_puit`/`alerts`), written automatically. Tags: `level`, `source`; field: `message`.
 - **`version` measurement** — a marker written by `deploy.sh` on each deploy (`event=deploy`)
@@ -99,6 +107,23 @@ The XIAO SAMD21 sensor firmware is built in a separate PlatformIO repo; the preb
 SSH) via `bossac`. Push a new binary + a `deploy/migrations/000N_flash_arduino_*.sh`
 migration to flash on deploy, or run `/flash` (admin only) on the Telegram bot to
 reflash the committed binary. Full workflow and recovery steps: `arduino/README.md`.
+
+**The Pi and the board share a versioned serial contract** — newline-delimited JSON over
+`/dev/ttyACM0`, one object per line each way, `proto = 2`. `sensors/read_puit.py` sends
+`{"id":n,"cmd":"read_puit"}` and matches the reply by its echoed `id`; the board answers
+with the distance plus the four ping counts, or with an explicit error `code` instead of a
+silent `0`. The full contract (commands, parameters, every error code) lives in the
+firmware repo's README — [PiJardin-Arduino_Software](https://github.com/weloic/PiJardin-Arduino_Software).
+`PROTO` in `read_puit.py` must match the flashed firmware: every line the board emits carries
+its `proto`, so a mismatch fails the handshake with `proto_mismatch` rather than recording
+numbers from a different contract. **Fix it by flashing (`/flash`), not by editing `PROTO`.**
+
+The error codes decide what happens next, which is the point of having them: `echo_timeout`
+and `insufficient_samples` are retried (ripples, an oblique surface); `sensor_fault` (the
+sensor ignores the trigger — power or wiring) and `out_of_range` (it answers but is misaimed
+or obstructed) are **not** retried and notify the admins on Telegram, throttled to once per
+6 h per code since the scheduled run fires every 5 minutes; anything else is a bug in the
+request the Pi sent. Admins can see one burst ping-by-ping with `/echantillons`.
 
 `bossac` (`bossa-cli`) is installed automatically by `deploy/bootstrap.sh`. Flashing
 stops `sensors.timer` and takes the serial-port lock for ~1 min, then restarts it; the

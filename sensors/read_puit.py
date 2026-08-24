@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import logging
+import itertools
 import contextlib
 from numpy import median
 
@@ -49,6 +50,30 @@ except Exception as e:
 ## Serial communication
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 9600
+
+## Firmware serial contract — newline-delimited JSON, one object per line each way. The
+## authority is the README of the firmware repo (PiJardin-Arduino_Software); the constants
+## below only size our own timeouts and guard our own requests. Everything else is
+## discovered from the board: it echoes the effective value of every parameter it used.
+PROTO = 2                       # must match the firmware; bumped only by a breaking change
+LINE_MAX = 192                  # longest request line the board accepts, bytes
+MAX_N = 25                      # most pings per burst; the board clamps anything above it
+N_DEFAULT = 10                  # pings per burst, board-side default
+TIMEOUT_DEFAULT_US = 45000      # per-ping echo timeout, board-side default
+ACK_TIMEOUT_DEFAULT_US = 50000  # per-ping wait for echo to *rise*, board-side default
+PING_GAP_S = 0.003              # the firmware's delay(3) between pings
+
+## ack_max_us is the module's measured trigger->rise latency, and ack_timeout_us the deadline
+## it is judged against — the one bound in the measurement path with no physical ground truth
+## behind it. Warn once the former reaches this fraction of the latter: a module getting
+## slower crosses the deadline eventually, and past that point the firmware reports perfectly
+## healthy hardware as a dead sensor. (Measured on the fitted module: 12.3 ms against a
+## 50 ms deadline, i.e. 25%.)
+ACK_MARGIN_WARN = 0.5
+
+## A physical sensor fault does not clear on its own and is not retried, but the scheduled
+## run fires every 5 minutes — throttle the admin notification per error code.
+FAULT_ALERT_INTERVAL_S = 6 * 3600
 
 ## Well geometry: the sensor measures the distance (cm) down to the water surface.
 ## Same conversion as the Grafana dashboards: volume_m3 = (220 - distance_cm) * 0.04
@@ -104,6 +129,254 @@ def query_volume_history(range_start):
             volumes.append(height_to_volume(record.get_value()))
     return times, volumes
 
+class PuitError(Exception):
+    """A request came back as status:"error", or got no correlated reply at all.
+
+    `code` is the firmware's error code and `resp` the full response dict (empty when
+    nothing came back). The measurement errors carry the four ping counts and the
+    effective parameters, so a single logged line explains itself.
+    """
+
+    def __init__(self, code, resp=None, message=None):
+        super().__init__(message or code)
+        self.code = code
+        self.resp = resp or {}
+
+
+class PuitRetryable(PuitError):
+    """Transient: ripples, an oblique surface, a lost line. Another burst may work."""
+
+
+class PuitPermanent(PuitError):
+    """Not fixable by retrying: a physical fault, or a bug in the request we sent."""
+
+
+## What to do about each firmware error code (decision table in the firmware README).
+## Anything not listed is a Pi-side bug — bad_param, bad_id, bad_request, line_too_long,
+## unknown_cmd — where retrying cannot help and the code has to be fixed instead.
+RETRYABLE_CODES = frozenset({'insufficient_samples', 'echo_timeout'})
+PHYSICAL_CODES = frozenset({'sensor_fault', 'out_of_range'})   # someone has to go and look
+
+## Request ids are a counter chosen by us and echoed verbatim, so a reply can be matched to
+## its request instead of being assumed to be the next line on the port.
+_request_id = itertools.count(1)
+
+
+def _check_proto(obj):
+    """Reject a board speaking a different protocol version, loudly and immediately.
+
+    Every line the firmware emits carries `proto`, so this catches an un-upgraded board
+    from any reply — not just the banner — before a value derived from a different
+    contract reaches the database.
+    """
+    proto = obj.get('proto')
+    if proto != PROTO:
+        raise PuitPermanent(
+            'proto_mismatch', obj,
+            message=f"Arduino speaks proto {proto!r}, this code speaks {PROTO} — flash the "
+                    f"matching firmware (/flash) or update {os.path.basename(__file__)}.")
+
+
+def _read_json_object(arduino, deadline):
+    """Return the next JSON object from the port, or None once `deadline` passes.
+
+    Anything that is not a JSON object is noise on a line-delimited JSON link (a truncated
+    line, boot chatter from a foreign firmware) — log it and keep reading, because the
+    reply we want may be right behind it.
+    """
+    while time.time() < deadline:
+        raw = arduino.readline()
+        if not raw:
+            continue                       # readline() timeout, not end of stream
+        line = raw.decode('utf-8', errors='ignore').strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            log.warning(f"Ignoring non-JSON line from Arduino: {line!r}")
+            continue
+        if not isinstance(obj, dict):
+            log.warning(f"Ignoring JSON that is not an object: {line!r}")
+            continue
+        return obj
+    return None
+
+
+def _burst_timeout(cmd, params):
+    """How long to wait for a reply: the worst case of every ping in the burst failing.
+
+    Sized against the slowest burst, never against a good reading. A healthy burst is back in
+    well under a second, but one where the sensor answers and then finds nothing spends the
+    full echo timeout on every ping, and one where nothing answers at all spends the full
+    rise deadline instead. Too short a deadline here turns a carefully diagnosed sensor_fault
+    into a generic no_reply — throwing the diagnosis away at exactly the moment it matters,
+    and blaming the link for what the firmware had correctly identified as the sensor.
+
+    Both per-ping waits are counted even though a single ping can only hit one of them: which
+    one it hits varies within a burst, so only their sum is a safe bound. At the defaults that
+    is ~3.0 s for a 10-ping burst and ~4.5 s for 25.
+    """
+    if cmd == 'status':
+        return 2.0
+    # Bound by what the board will actually do, not by what we asked for: out-of-range
+    # parameters are clamped rather than rejected, so n=999 is 25 pings — and without the
+    # clamp here, a typo in a diagnostic would strand the caller for minutes.
+    n = min(params.get('n') or N_DEFAULT, MAX_N)
+    timeout_us = min(params.get('timeout_us') or TIMEOUT_DEFAULT_US, 60000)
+    ack_timeout_us = min(params.get('ack_timeout_us') or ACK_TIMEOUT_DEFAULT_US, 60000)
+    return 2.0 + n * ((timeout_us + ack_timeout_us) / 1e6 + PING_GAP_S)
+
+
+def request(arduino, cmd, timeout=None, **params):
+    """Send one request and return the response dict, or raise PuitError.
+
+    Parameters left out (or passed as None) are simply not sent: the board is stateless and
+    falls back to its own documented defaults, and the response echoes what it actually
+    used — including any value it clamped into range.
+    """
+    params = {name: value for name, value in params.items() if value is not None}
+    req_id = next(_request_id)
+    line = json.dumps({'id': req_id, 'cmd': cmd, **params}, separators=(',', ':'))
+    payload = line.encode('utf-8') + b'\n'
+    if len(payload) > LINE_MAX:
+        raise PuitPermanent('line_too_long', message=f"request is {len(payload)} B, over the "
+                                                     f"board's {LINE_MAX} B line limit: {line}")
+
+    if timeout is None:
+        timeout = _burst_timeout(cmd, params)
+    log.debug(f"-> {line}")
+    arduino.write(payload)
+
+    deadline = time.time() + timeout
+    while True:
+        resp = _read_json_object(arduino, deadline)
+        if resp is None:
+            raise PuitRetryable('no_reply', message=f"no reply to {cmd} (id={req_id}) "
+                                                    f"within {timeout:.1f} s")
+        log.debug(f"<- {resp}")
+        _check_proto(resp)
+
+        if resp.get('type') != 'resp':
+            continue                       # a boot banner, or a line meant for nobody
+        if resp.get('id') is None:
+            # bad_request / line_too_long / bad_id: the board could not tell which request
+            # it was answering, so it has no id to echo. Ours is the only one in flight.
+            raise PuitPermanent(resp.get('code', 'bad_request'), resp,
+                                message=f"{cmd}: {resp.get('code', 'bad_request')} — the board "
+                                        f"could not parse the request we sent")
+        if resp.get('id') != req_id:
+            # A late reply to a request that already timed out. Correlating on the id is
+            # exactly what stops it from being read as the answer to this one.
+            log.info(f"Discarding stale reply for id={resp['id']} (waiting for {req_id}).")
+            continue
+
+        if resp.get('status') == 'ok':
+            return resp
+
+        code = resp.get('code', 'unknown')
+        error = PuitRetryable if code in RETRYABLE_CODES else PuitPermanent
+        raise error(code, resp, message=f"{cmd}: {code}"
+                                        + (f" [{describe_counts(resp)}]" if 'n' in resp else "")
+                                        + (f" field={resp['field']}" if 'field' in resp else ""))
+
+
+def describe_counts(resp):
+    """Summarise which physical outcome the pings of a burst had.
+
+    Present on every measurement reply, success or failure, and the level worth recording:
+    `rejected=10` means the sensor is alive and aimed at the wrong thing, `no_response=10`
+    means it is not talking to us at all. Those were indistinguishable under proto 1.
+    """
+    parts = [f"n={resp.get('n', '?')}"]
+    parts += [f"{field[2:]}={resp.get(field, '?')}"
+              for field in ('n_valid', 'n_timeout', 'n_rejected')]
+
+    # n_stuck is a subset of n_no_response, never a fifth bucket, so it is rendered inside
+    # it — the four buckets have to keep visibly summing to n. Shown only when non-zero:
+    # zero is the healthy case, and it is absent altogether on firmware before 2.1.0.
+    no_response = f"no_response={resp.get('n_no_response', '?')}"
+    if resp.get('n_stuck'):
+        no_response += f"(stuck={resp['n_stuck']})"
+    parts.append(no_response)
+
+    # Reported against the window it is judged against, so the one assumption in the
+    # measurement path with no physical ground truth behind it is never invisible again.
+    if resp.get('ack_max_us') is not None:
+        parts.append(f"ack_max={resp['ack_max_us']}/{resp.get('ack_timeout_us', '?')}µs")
+
+    if resp.get('ping_status'):
+        parts.append(resp['ping_status'])
+    return ' '.join(parts)
+
+
+def log_burst_health(resp):
+    """Log what a successful burst cost, at the level each failure mode deserves.
+
+    Lost echoes over water are ordinary — ripples, an oblique surface — and the median over
+    the survivors is still sound, so they are an info line. An ignored trigger has no benign
+    cause: it means the sensor did not react at all, which is the earliest sign of a failing
+    connection, and no min_valid threshold would surface it because the burst still
+    succeeded. (The firmware's 3 ms inter-ping gap is below the module's recommended
+    measurement cycle, so an isolated one can be a timing artefact; a burst that is mostly
+    no-response is unambiguous.)
+    """
+    if resp.get('n_no_response'):
+        # n_stuck splits this into the two wiring faults it can be, at opposite ends of the
+        # harness — see _sensor_fault_text() for why the distinction is worth carrying.
+        side = ("echo held high, so no trigger was even fired — check the echo line (D7)"
+                if resp.get('n_stuck') else "check power, the module, and the trigger line")
+        log.warning(f"Sensor ignored {resp['n_no_response']} trigger(s) — {side} "
+                    f"[{describe_counts(resp)}]")
+    elif resp.get('n_valid', 0) < resp.get('n', 0):
+        log.info(f"Lost {resp['n'] - resp['n_valid']} ping(s) to the environment "
+                 f"[{describe_counts(resp)}]")
+
+    _log_ack_margin(resp)
+
+
+def _log_ack_margin(resp):
+    """Warn when the module's reaction time is closing on the deadline it is judged against.
+
+    ack_max_us is not a fault signal in itself — it is how long the module took to react, and
+    it is worth watching because the deadline above it is the only bound here derived from a
+    datasheet rather than from physics. A module going soft drifts upward for weeks, and the
+    moment it crosses ack_timeout_us the firmware starts reporting healthy hardware as a dead
+    sensor, with a code that says "unpowered, dead, or a wire off" and sends someone to the
+    well. Catching the drift is far cheaper than diagnosing that alert. Trend it in Grafana
+    too — the field is recorded on every point.
+    """
+    ack_max = resp.get('ack_max_us')
+    window = resp.get('ack_timeout_us')
+    # 0 means nothing answered (there is no latency to report); absent means fw < 2.1.0.
+    if not ack_max or not window:
+        return
+    if ack_max > ACK_MARGIN_WARN * window:
+        log.warning(f"Sensor took {ack_max} µs to answer a trigger — over "
+                    f"{ACK_MARGIN_WARN:.0%} of the {window} µs deadline. A module that keeps "
+                    f"slowing down will start being reported as dead hardware; re-measure "
+                    f"with /echantillons and raise ack_timeout_us in the firmware.")
+
+
+def measure(arduino, cmd='read_puit', retries=3, delay=0.5, **params):
+    """Run one measurement burst, retrying only what a retry can fix.
+
+    Returns the successful response dict. Transient failures (too few valid pings, no echo,
+    a lost reply) are retried; a physical fault or a malformed request raises straight out,
+    because repeating it would only delay the report by `retries * delay`.
+    """
+    last = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return request(arduino, cmd, **params)
+        except PuitRetryable as e:
+            last = e
+            log.warning(f"{cmd} attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+    raise last
+
+
 def open_arduino():
     # Open with DTR deasserted, then assert it: the edge auto-resets the Arduino
     # deterministically. Relying on open() alone is not enough — whether it
@@ -119,58 +392,169 @@ def open_arduino():
     time.sleep(0.25)
     arduino.dtr = True
 
-    # The reset pulse rebooted the Arduino; wait for it to come back up
-    log.info("Waiting for Arduino to start serial communication...")
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        line = arduino.readline().decode('utf-8', errors='ignore').strip()
-        if line:
-            log.info(f"Arduino says: {line}")
-        if line == "Started serial com":
-            break
-        time.sleep(0.1)
-    log.info("Proceeding (ready or timeout).")
-    arduino.reset_input_buffer()
-    return arduino
+    # The reset pulse rebooted the Arduino; wait for the one line it prints on boot.
+    try:
+        log.info("Waiting for the Arduino boot banner...")
+        deadline = time.time() + 10
+        banner = None
+        while banner is None:
+            obj = _read_json_object(arduino, deadline)
+            if obj is None:
+                break
+            if obj.get('type') == 'ready':
+                banner = obj
+            else:
+                log.info(f"Ignoring pre-banner line: {obj}")
 
-def get_sensor_data(arduino, retries=3, delay=0.5):
-    for attempt in range(retries):
-        log.info(f'Get sensor data (attempt {attempt + 1})')
-        arduino.write(b'READ_PUIT\n')
-        time.sleep(delay)
-        raw = arduino.readline()
-
-        if raw:
+        if banner is None:
+            # Either the reset edge did not take or we came in mid-line. The board is
+            # stateless and will answer anyway, but confirm what is on the other end before
+            # trusting a reading — a board that never rebooted is the frozen-/mesure case.
+            log.warning("No boot banner within 10 s; probing the board with a status request.")
             try:
-                height_str = raw.decode('utf-8').strip()
-                log.info(f'received data: {height_str}')
-                return float(height_str)
-            except ValueError:
-                # WARNING+ auto-records to InfluxDB via the handler; keep the raw value.
-                log.warning(f"Invalid float format from Arduino: {raw!r}")
-        else:
-            log.info("No response from Arduino.")
-    log.error("Failed to get valid sensor data after retries.")
-    return None
+                banner = request(arduino, 'status')
+            except PuitRetryable as e:
+                raise PuitPermanent(
+                    'no_banner',
+                    message=f"Arduino neither announced itself nor answered a status request "
+                            f"({e}) — it is wedged, or still running pre-proto-{PROTO} firmware "
+                            f"that does not speak JSON. /flash it.") from e
 
-def load_previous_measure():
+        _check_proto(banner)
+        log.info(f"Arduino ready: fw={banner.get('fw', '?')} proto={banner.get('proto')}")
+        return arduino
+    except Exception:
+        arduino.close()     # never leak the port when the handshake fails
+        raise
+
+
+def get_sensor_data(arduino, retries=3, delay=0.5, **params):
+    """Median distance in cm over the valid pings, or None if there is no usable reading.
+
+    The tolerant wrapper around measure(), for the callers where a reading is a health check
+    rather than data (post-flash verification): every failure collapses to None. The
+    measurement path calls measure() directly — it needs the error code to decide whether to
+    retry, alert, or record.
+    """
+    try:
+        resp = measure(arduino, retries=retries, delay=delay, **params)
+    except PuitError as e:
+        # WARNING+ auto-records to InfluxDB via the handler in the scheduled run.
+        log.error(f"No valid sensor reading: {e}")
+        return None
+    log_burst_health(resp)
+    log.info(f"Read {resp['value']} cm (pulse {resp.get('pulse_us')} µs) "
+             f"[{describe_counts(resp)}]")
+    return resp['value']
+
+def load_state():
+    """Read the sensor state file (last measure, last fault alert); {} if unreadable."""
     try:
         with open(STATE_FILE, 'r') as f:
-            data = json.load(f)
-        value = data.get('previous_measure')
-        if isinstance(value, (int, float)):
-            return float(value)
-        return None
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except FileNotFoundError:
+        return {}
     except Exception as e:
-        log.warning(f"Could not load previous measure ({e}); treating as unknown.")
-        return None
+        log.warning(f"Could not load {STATE_FILE} ({e}); treating the state as empty.")
+        return {}
 
-def save_previous_measure(height):
+def save_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump({'previous_measure': height}, f)
+            json.dump(state, f)
     except Exception as e:
-        log.warning(f"Could not save previous measure ({e}).")
+        log.warning(f"Could not save {STATE_FILE} ({e}).")
+
+def load_previous_measure():
+    value = load_state().get('previous_measure')
+    return float(value) if isinstance(value, (int, float)) else None
+
+def save_previous_measure(height):
+    # Merge, don't overwrite: the fault-alert timestamps live in the same file.
+    state = load_state()
+    state['previous_measure'] = height
+    save_state(state)
+
+def fault_alert_key(error):
+    """Throttle slot for a fault alert: the code, plus which wiring fault it turned out to be.
+
+    The two sensor_fault flavours get separate slots on purpose. They share a code but send
+    someone to opposite ends of the harness, so if an echo-line fault is repaired and a
+    trigger-side one appears an hour later, the second must not be swallowed by the first
+    one's 6 h throttle.
+    """
+    if error.code != 'sensor_fault':
+        return error.code
+    stuck = error.resp.get('n_stuck')
+    if stuck is None:
+        return error.code                       # fw < 2.1.0: undifferentiated, one slot
+    return f"{error.code}:{'stuck' if stuck else 'no_ack'}"
+
+
+def _sensor_fault_text(resp):
+    """The sensor_fault message, split by which end of the wiring to go and look at.
+
+    n_stuck > 0 means echo was already HIGH when the ping began, so the trigger was never
+    fired at all: the fault is on the echo line — held high, miswired, a damaged input.
+    n_stuck == 0 means triggers did go out and nothing ever came back: power, the module, or
+    the trigger line. Both are critical and neither is retried, but they are opposite ends of
+    the harness, so an alert that does not say which wastes the trip.
+
+    A board on firmware before 2.1.0 does not report n_stuck at all. Say so rather than
+    assuming zero: guessing here would send someone confidently to the wrong wire, which is
+    the same unearned certainty the firmware added these fields to remove.
+    """
+    tail = "Aucune mesure n'est enregistrée jusqu'à réparation."
+    stuck = resp.get('n_stuck')
+    if stuck is None:
+        return ("🚨 Puit : le capteur ne répond plus au déclenchement — alimentation, câblage "
+                f"ou module HS. {tail}")
+    if stuck:
+        return ("🚨 Puit : la ligne echo reste haute — aucun déclenchement n'a même été émis. "
+                "À vérifier côté echo (D7) : câble, adaptateur de niveau, entrée endommagée. "
+                f"{tail}")
+    return ("🚨 Puit : les déclenchements sont émis mais le capteur ne répond jamais — "
+            f"alimentation, module HS, ou ligne trigger (D8). {tail}")
+
+
+def notify_sensor_fault(error):
+    """Tell the admins the sensor needs physical attention — at most once per fault per 6 h.
+
+    Only for the two codes that are never retried and will not clear by themselves. The
+    throttle is the point: the scheduled run fires every 5 minutes, so the same dead sensor
+    would otherwise send ~290 identical messages a day.
+    """
+    state = load_state()
+    sent = state.get('fault_alerts') or {}
+    now = time.time()
+    key = fault_alert_key(error)
+    last = sent.get(key)
+    if isinstance(last, (int, float)) and now - last < FAULT_ALERT_INTERVAL_S:
+        log.info(f"Fault alert for {key} already sent {(now - last) / 3600:.1f} h ago; "
+                 "not repeating.")
+        return
+
+    detail = describe_counts(error.resp) if error.resp else str(error)
+    if error.code == 'sensor_fault':
+        text = _sensor_fault_text(error.resp)
+        # Spelled out even when zero, unlike in the log line: these are the two numbers that
+        # turn "go look at the well" into "go look at the echo wire", and an ack_max_us of 0
+        # confirms nothing answered at all rather than answering just outside the window.
+        detail += (f"\nn_stuck={error.resp.get('n_stuck', 'n/a')} · "
+                   f"ack_max_us={error.resp.get('ack_max_us', 'n/a')}")
+    else:
+        text = ("🚨 Puit : le capteur répond mais toutes les mesures sont hors plage — "
+                "probablement mal orienté ou obstrué (support, paroi, surface).")
+    try:
+        alerts.send_telegram(alerts.admin_recipients(), f"{text}\n({detail})")
+    except Exception as e:
+        log.error(f"Could not notify admins of {error.code}: {e}")
+        return          # not recorded as sent, so the next run tries again
+
+    sent[key] = now
+    state['fault_alerts'] = sent
+    save_state(state)
 
 def write_influx_version(event='deploy'):
     """Record a Point('version') marking the currently-deployed versions.
@@ -221,7 +605,25 @@ def write_service_failure(unit):
         log.warning(f"Could not write service-failure to InfluxDB: {e}")
         return False
 
-def write_influx_measurement(heigth_median, resampled=False):
+## Extra fields stored next to the distance, and the type they must keep for ever (InfluxDB
+## rejects a field that changes type). pulse_us and temp_c are the raw echo width and the air
+## temperature it was converted with: the pulse is the only thing the board actually measures,
+## so storing both means a future correction to the µs->cm divisor can be replayed over
+## everything already recorded. The counts make a sensor degrading over weeks visible as a
+## graph (n_valid/n) instead of as a surprise the morning it dies.
+##
+## n_stuck and ack_max_us arrive with fw 2.1.0 and are simply absent on an older board — the
+## loop below skips whatever is missing, so this stays compatible either way. ack_max_us is
+## the one to graph next to n_valid/n: it is the module's reaction time, and its upward trend
+## is both an early warning of a dying module and a prediction of when the firmware will
+## begin reporting a live sensor as dead.
+MEASUREMENT_FIELDS = (
+    ('pulse_us', float), ('temp_c', float),
+    ('n', int), ('n_valid', int), ('n_timeout', int), ('n_rejected', int), ('n_no_response', int),
+    ('n_stuck', int), ('ack_max_us', int),
+)
+
+def write_influx_measurement(heigth_median, resampled=False, resp=None):
     if write_api is None:
         log.warning("No InfluxDB write API; measurement not recorded.")
         return False
@@ -231,13 +633,18 @@ def write_influx_measurement(heigth_median, resampled=False):
     rounded = roundTime(datetime.datetime.now(datetime.timezone.utc), roundTo=300)
 
     log.info(f'Write influxdb time {rounded.isoformat()}')
-    # Create a data point for InfluxDB
+    # Create a data point for InfluxDB. lenght_median (cm) is the field the Grafana
+    # dashboards read; the rest is diagnosis and future repair.
     point = (
         Point('height_measure')  # Measurement name
         .tag('resampled', resampled)
         .field('lenght_median', heigth_median)
-        .time(rounded, WritePrecision.S)
     )
+    for name, cast in MEASUREMENT_FIELDS:
+        value = (resp or {}).get(name)
+        if isinstance(value, (int, float)):
+            point.field(name, cast(value))
+    point.time(rounded, WritePrecision.S)
 
     # Write data to InfluxDB
     try:
@@ -249,27 +656,56 @@ def write_influx_measurement(heigth_median, resampled=False):
 
 
 def collect_puit_data(arduino):
+    """One measurement cycle: burst, resample if the level jumped, record, check thresholds.
+
+    Returns (height_cm, resampled, db_ok). Raises PuitError when the sensor produced no
+    usable reading — the code says whose problem it is, and it is already logged at the
+    level it deserves and alerted on if someone has to go to the well.
+    """
     max_diff_tolerance = 5 # cm
     resampled = False
 
     previous_measure = load_previous_measure()
-    height = get_sensor_data(arduino)
+    try:
+        resp = measure(arduino)
+    except PuitPermanent as e:
+        if e.code in PHYSICAL_CODES:
+            # A silent sensor is critical, a misaimed one an error; neither is retried,
+            # both need someone at the well.
+            log.log(logging.CRITICAL if e.code == 'sensor_fault' else logging.ERROR,
+                    f"Sensor needs physical attention: {e}")
+            notify_sensor_fault(e)
+        else:
+            log.error(f"Arduino rejected the request: {e} — bug in "
+                      f"{os.path.basename(__file__)}, retrying cannot help.")
+        raise
+    except PuitRetryable as e:
+        log.warning(f"No usable reading this run: {e}")
+        raise
 
-    if height is None:
-        log.warning("No valid height reading this run; skipping write.")
-        return None, False, False
+    log_burst_health(resp)
+    height = resp['value']
+    responses = [resp]
 
     if previous_measure is not None:
         if abs(height-previous_measure) > max_diff_tolerance:
-            height_medians = [height]
-            for i in range(4):
-                sample = get_sensor_data(arduino)
-                if sample is not None:
-                    height_medians.append(sample)
-            height = float(median(height_medians))
+            for _ in range(4):
+                try:
+                    extra = measure(arduino)
+                except PuitError as e:
+                    # Keep the bursts we do have; the first one already succeeded.
+                    log.warning(f"Resample failed: {e}")
+                    continue
+                log_burst_health(extra)
+                responses.append(extra)
+            height = float(median([r['value'] for r in responses]))
             resampled = True
 
-    db_ok = write_influx_measurement(height, resampled)
+    # Record the raw pulse and counts of the burst that produced the retained value, so
+    # pulse_us and lenght_median stay the same measurement — that is what makes a later
+    # divisor correction replayable over the history.
+    kept = min(responses, key=lambda r: abs(r['value'] - height))
+    db_ok = write_influx_measurement(height, resampled, kept)
     save_previous_measure(height)
 
     try:
@@ -324,29 +760,39 @@ def _with_arduino(lock_timeout, action):
 def measure_once(lock_timeout=0):
     """Run one full measurement cycle: lock, open serial, measure (+DB write), clean up.
 
-    Returns (height, resampled, db_ok); height is None if the sensor gave no valid
-    reading. Raises TimeoutError if another measurement holds the lock past
-    lock_timeout seconds.
+    Returns (height, resampled, db_ok). Raises PuitError if the sensor gave no valid
+    reading, or TimeoutError if another measurement holds the lock past lock_timeout
+    seconds.
     """
     return _with_arduino(lock_timeout, collect_puit_data)
 
 
-def raw_samples_once(lock_timeout=0):
-    """Ask the Arduino for its raw ping array (SAMPLING command) — diagnostics only.
+def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):
+    """Ask the Arduino for one `sampling` burst — per-ping detail, diagnostics only.
 
-    Returns the raw JSON-ish line (e.g. "[61.00, 61.00, 158.00, ...]") or None if
-    the Arduino did not answer. Raises TimeoutError like measure_once.
+    Returns the response dict: the same statistics as a measurement plus index-aligned
+    `samples`/`pulse_us`/`ack_us` arrays and `ping_status`, one character per ping. That last
+    field is the only per-ping way to tell a sensor that answered but saw nothing (T) from one
+    that ignored the trigger (N) or never got one (S) — all three are null in `samples`.
+    `ack_us` follows a different null rule and separates T from N/S on its own: it holds a
+    latency for every ping the module engaged with, including the timeouts, so a null pulse
+    beside a real ack reads as "answered, found nothing" — a sensor returning no data that is
+    nonetheless alive.
+
+    `ack_timeout_us` (500–60000, default 50000) widens the per-ping wait for echo to rise.
+    That is the diagnostic for a suspicious sensor_fault: if a burst reporting
+    n_no_response == n comes back valid at a wider window, the window was the fault and the
+    sensor was never broken — which is exactly what the firmware's original 2 ms deadline did
+    to a healthy module that takes 12.3 ms.
+
+    Not retried: a diagnostic wants the failure it actually got. Raises PuitError (with the
+    failing response on `.resp`) if the burst failed, TimeoutError like measure_once.
     """
     def action(arduino):
-        arduino.reset_input_buffer()
-        arduino.write(b'SAMPLING\n')
-        # 10 pings, worst case ~1 s each when an echo times out.
-        deadline = time.time() + 12
-        while time.time() < deadline:
-            line = arduino.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                return line
-        return None
+        resp = measure(arduino, cmd='sampling', retries=1, n=n,
+                       ack_timeout_us=ack_timeout_us)
+        log_burst_health(resp)
+        return resp
 
     return _with_arduino(lock_timeout, action)
 
@@ -387,9 +833,13 @@ if __name__ == '__main__':
     except TimeoutError as e:
         log.error(str(e))
         sys.exit(1)
+    except PuitError:
+        # collect_puit_data has already logged this at the right level and alerted if the
+        # sensor needs attention; the exit code is what systemd's OnFailure hook keys on.
+        sys.exit(1)
     except Exception as e:
         log.error(f"Could not open serial port {SERIAL_PORT}: {e}")
         sys.exit(1)
 
-    if height is None or not db_ok:
+    if not db_ok:
         sys.exit(1)
