@@ -77,7 +77,10 @@ SENSOR_ERROR_FR = {
                             "ou module HS. Intervention nécessaire au puits.",
     'proto_mismatch':       "Le firmware de l'Arduino ne correspond pas au logiciel du Pi. "
                             "Un admin doit lancer /flash.",
-    'no_banner':            "L'Arduino ne démarre pas correctement. Un admin doit lancer /flash.",
+    ## Historical code name (it once meant "printed no boot banner"); the condition it now
+    ## reports is that the board answered nothing at all when asked to identify itself.
+    'no_banner':            "L'Arduino ne répond plus du tout : carte bloquée ou firmware "
+                            "incompatible. Un admin doit lancer /flash.",
 }
 
 ## sensor_fault covers two faults at opposite ends of the wiring, told apart by n_stuck: echo

@@ -127,6 +127,14 @@ firmware repo's README — [PiJardin-Arduino_Software](https://github.com/weloic
 its `proto`, so a mismatch fails the handshake with `proto_mismatch` rather than recording
 numbers from a different contract. **Fix it by flashing (`/flash`), not by editing `PROTO`.**
 
+**The handshake is a `status` request, not the boot banner.** Opening the port does not reset the
+board — DTR auto-reset needs a capacitor to the RESET pin, which only bridge-chip boards have,
+while the XIAO speaks USB natively (on SAMD, 1200 baud is the reset convention, which is how the
+flasher enters the bootloader). So the board runs uninterrupted across opens and only banners
+after a real reboot; waiting for one previously cost a 10 s timeout on every open. `status`
+answers on demand with `proto`, `role`, `fw` and `uptime_ms` — that last one being the only way
+to notice a board that restarted on its own between measurements.
+
 The error codes decide what happens next, which is the point of having them: `echo_timeout`
 and `insufficient_samples` are retried (ripples, an oblique surface); `sensor_fault` (the
 sensor ignores the trigger — power or wiring) and `out_of_range` (it answers but is misaimed

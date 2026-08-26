@@ -25,11 +25,18 @@ The XIAO SAMD21 has an Arduino-Zero-style **SAM-BA bootloader**. `flash_firmware
 2. does a **1200-baud "touch"** on that port, which resets the board into its bootloader;
 3. runs `bossac -p ttyACM0 --offset=0x2000 -e -w -v -R firmware.bin`
    (the app lives at `0x2000`; the bootloader below it is never overwritten);
-4. reopens the port and confirms the boot banner + a real reading. Resolution is redone here
-   deliberately — the image just written may advertise a product string the old one did not.
-   The banner carries the protocol version and the board's own role, so an image that does not
-   match what `sensors/read_puit.py` speaks, or that belongs to a *different* board, fails
-   verification here instead of quietly recording numbers from a different contract.
+4. reopens the port, asks the board to identify itself with a `status` request, and confirms a
+   real reading. Resolution is redone here deliberately — the image just written may advertise
+   a product string the old one did not. The reply carries the protocol version and the board's
+   own role, so an image that does not match what `sensors/read_puit.py` speaks, or that belongs
+   to a *different* board, fails verification here instead of quietly recording numbers from a
+   different contract.
+
+Note the Pi does **not** wait for the boot banner. Nothing in a normal open resets a XIAO — DTR
+auto-reset needs a capacitor to the RESET pin that only bridge-chip boards have, and on SAMD the
+1200-baud touch in step 2 is the reset convention. So the board runs uninterrupted across opens
+and only banners after a genuine reboot; `status` answers on demand and reports `uptime_ms` as
+well, which is what makes a board that rebooted on its own visible in the journal.
 
 Requires `bossac` (Debian package `bossa-cli`, ≥ 1.8 for `--offset`) — installed
 automatically by `deploy/bootstrap.sh`. The Pi user must be in the `dialout` group

@@ -210,6 +210,18 @@ def _check_board(banner, device):
                     f"wrong device was resolved. Refusing to record its readings as {BOARD!r}.")
 
 
+def _format_uptime(ms):
+    """Human-readable board uptime, or '' when the firmware reported none."""
+    if not isinstance(ms, (int, float)):
+        return ''
+    seconds = int(ms // 1000)
+    if seconds < 120:
+        return f" up={seconds}s"
+    if seconds < 3600:
+        return f" up={seconds // 60}min"
+    return f" up={seconds // 3600}h{(seconds % 3600) // 60:02d}"
+
+
 def _read_json_object(arduino, deadline):
     """Return the next JSON object from the port, or None once `deadline` passes.
 
@@ -411,7 +423,10 @@ def measure(arduino, cmd='read_puit', retries=3, delay=0.5, **params):
 
 
 def open_arduino(device=None):
-    """Open the board's serial port, reset it, and wait for it to identify itself.
+    """Open the board's serial port and confirm what is on the other end.
+
+    Returns an open port whose board has answered with a matching `proto` and the expected
+    `role`; raises rather than hand back a port to something unidentified.
 
     device: an explicit node, bypassing resolution. Only the flasher passes this — it may be
     talking to a board whose descriptor has not come back yet, or one targeted with --port
@@ -424,11 +439,19 @@ def open_arduino(device=None):
     if device is None:
         device = boards.resolve(BOARD)
 
-    # Open with DTR deasserted, then assert it: the edge auto-resets the Arduino
-    # deterministically. Relying on open() alone is not enough — whether it
-    # produces a reset edge depends on the DTR state left by the previous
-    # session, and an un-reset board serves a stale reading (frozen /mesure bug:
-    # no boot banner in the journal, constant 61.00 response).
+    # Assert DTR once the port is open, the way a serial terminal would: the SAMD21's CDC
+    # endpoint derives "a host is attached" from DTR, and the core can discard writes made
+    # while it is low. Deasserting first guarantees the transition rather than depending on
+    # whatever the previous session left behind.
+    #
+    # It does NOT reset the board — a natural assumption, and the reason this code originally
+    # waited for a boot banner. DTR-as-reset is an AVR arrangement: a capacitor from the USB
+    # bridge chip's DTR pin to the MCU's RESET pin. The XIAO has neither, because the SAMD21
+    # speaks USB natively — DTR is just a flag in a CDC control request that nothing acts on
+    # at this baud rate. On SAMD the reset convention is opening the port at 1200 baud
+    # (see enter_bootloader in arduino/flash_firmware.py), and that enters the bootloader
+    # rather than restarting the sketch. So the board runs uninterrupted across opens and
+    # never re-announces itself; its identity is established by the handshake below.
     arduino = serial.Serial()
     arduino.port = device
     arduino.baudrate = boards.config(BOARD)['baud']
@@ -438,38 +461,31 @@ def open_arduino(device=None):
     time.sleep(0.25)
     arduino.dtr = True
 
-    # The reset pulse rebooted the Arduino; wait for the one line it prints on boot.
     try:
-        log.info("Waiting for the Arduino boot banner...")
-        deadline = time.time() + 10
-        banner = None
-        while banner is None:
-            obj = _read_json_object(arduino, deadline)
-            if obj is None:
-                break
-            if obj.get('type') == 'ready':
-                banner = obj
-            else:
-                log.info(f"Ignoring pre-banner line: {obj}")
-
-        if banner is None:
-            # Either the reset edge did not take or we came in mid-line. The board is
-            # stateless and will answer anyway, but confirm what is on the other end before
-            # trusting a reading — a board that never rebooted is the frozen-/mesure case.
-            log.warning("No boot banner within 10 s; probing the board with a status request.")
-            try:
-                banner = request(arduino, 'status')
-            except PuitRetryable as e:
-                raise PuitPermanent(
-                    'no_banner',
-                    message=f"Arduino neither announced itself nor answered a status request "
-                            f"({e}) — it is wedged, or still running pre-proto-{PROTO} firmware "
-                            f"that does not speak JSON. /flash it.") from e
+        # Ask the board who it is instead of waiting for the banner it only prints on a real
+        # reboot. Waiting for that banner cost the full 10 s timeout on every single open —
+        # ~48 min/day across the scheduled runs — and then fell through to this same request
+        # anyway. `status` is also the better handshake: it answers synchronously and carries
+        # proto, role, fw and uptime_ms, where the banner carries the first three. Bounded at
+        # 2 s by _burst_timeout. A banner still unread in the buffer (we did just catch a
+        # board mid-boot) is skipped harmlessly — request() ignores anything not a `resp`.
+        try:
+            banner = request(arduino, 'status')
+        except PuitRetryable as e:
+            raise PuitPermanent(
+                'no_banner',
+                message=f"The board on {device} did not answer a status request ({e}) — it is "
+                        f"wedged, or running pre-proto-{PROTO} firmware that does not speak "
+                        f"JSON. /flash it.") from e
 
         _check_proto(banner)
         _check_board(banner, device)
+        # uptime is the only thing that reveals a board which rebooted on its own between
+        # measurements — a brownout or a watchdog — which was previously invisible: a board
+        # that never announces itself looks identical whether or not it restarted.
         log.info(f"Arduino ready on {device}: role={banner.get('role', '?')} "
-                 f"fw={banner.get('fw', '?')} proto={banner.get('proto')}")
+                 f"fw={banner.get('fw', '?')} proto={banner.get('proto')}"
+                 f"{_format_uptime(banner.get('uptime_ms'))}")
         return arduino
     except Exception:
         arduino.close()     # never leak the port when the handshake fails
