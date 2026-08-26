@@ -29,6 +29,15 @@ All Python components log through the standard `logging` module (configured once
 journal owns retention. Lines are formatted `LEVEL [module] message`; journald adds the
 timestamp. Set `LOG_LEVEL` in `.env` (default `INFO`) to change verbosity without a code change.
 
+**Transient Telegram API failures are collapsed on purpose.** A Telegram-side 502 arrives as a
+burst of retries, and with no error handler registered python-telegram-bot logged each one with
+a full traceback — one upstream blip produced ~200 lines and pushed everything else out of the
+15-line `/logs` window, which is the only view into the Pi. `on_error` in `telegram_bot/bot.py`
+now logs the first as a single WARNING and mutes the same error for 5 min, reporting
+`(+N more suppressed)` when it next speaks. Errors that are *not* transient — `BadRequest`
+(which subclasses `NetworkError` but means the API rejected our request), `Conflict`,
+`InvalidToken`, and any bug in our own handlers — keep their full traceback.
+
 Read logs on the Pi with `journalctl -u <unit>`, or remotely (admin only) via the Telegram
 `/logs` command:
 

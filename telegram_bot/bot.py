@@ -6,12 +6,14 @@ import re
 import io
 import sys
 import html
+import time
 import asyncio
 import logging
 import datetime
 import subprocess
 
 from telegram import Update
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ## read_puit.py lives in sensors/; the shared `common` package lives at the repo root. Both
@@ -54,6 +56,11 @@ PASSWORD_TO_ROLE = {
 }
 
 MAX_FAILED_ATTEMPTS = 10
+
+## How long to stay quiet after logging one transient Telegram API failure. A single 502 blip
+## arrives as a burst of retries (~8 in 30 s), and /logs shows only 15 lines inline — without
+## this, one upstream hiccup crowds every real message out of the window we can actually read.
+TRANSIENT_ERROR_MUTE_S = 300
 
 ## What to tell the user for each firmware error code (the contract lives in read_puit.py).
 ## The split that matters here is "try again in a minute" vs "someone has to go to the well"
@@ -633,6 +640,68 @@ async def graphe7j(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_graph(update, context, "-7d", "Historique 7 jours")
 
 # -------------------------------------------------------------------------------------------------
+# ERROR HANDLING
+
+## Last transient failure logged, so a burst collapses to one line: the exception class, how
+## many further ones were swallowed, and when to speak up again.
+_transient = {'name': None, 'suppressed': 0, 'mute_until': 0.0}
+
+def _is_transient(error):
+    """True for failures python-telegram-bot's own retry loop recovers from unaided.
+
+    `BadRequest` subclasses `NetworkError` in python-telegram-bot but means the opposite
+    thing — the API rejected *our* request (bad parse_mode, oversized message, stale chat
+    id) — so it is excluded here and keeps its traceback. `Conflict` and `InvalidToken` are
+    not transient either and fall through to the same treatment.
+    """
+    if isinstance(error, BadRequest):
+        return False
+    return isinstance(error, (NetworkError, TimedOut, RetryAfter))
+
+def _describe_update(update):
+    """Short, safe identifier for whatever was being handled when an error surfaced.
+
+    Only the chat id and the command word: the rest of the message is deliberately dropped
+    because `/start <password>` would otherwise write a live password into the journal.
+    """
+    if not isinstance(update, Update):
+        return "a polling cycle (no update)"
+    chat = update.effective_chat
+    text = (update.message.text or '') if update.message else ''
+    command = text.split(maxsplit=1)[0] if text else '(no text)'
+    return f"chat {chat.id if chat else '?'} {command}"
+
+async def on_error(update, context):
+    """Log Telegram errors without burying the journal in stack traces.
+
+    Without an error handler registered, python-telegram-bot logs every unhandled exception
+    with full `exc_info`. One transient Telegram 502 arrives as a burst of retries, so a
+    single upstream blip became ~200 lines of traceback — and since `/logs` is the only way
+    into this Pi and shows 15 lines inline, that reliably hid whatever was actually wrong.
+
+    Transient API failures therefore collapse to one throttled line. Everything else keeps
+    its traceback, because that is a bug in our code and the stack is the useful part.
+    """
+    error = context.error
+
+    if not _is_transient(error):
+        log.error(f"Unhandled error while processing {_describe_update(update)}", exc_info=error)
+        return
+
+    name = type(error).__name__
+    now = time.monotonic()
+
+    if _transient['name'] == name and now < _transient['mute_until']:
+        _transient['suppressed'] += 1
+        return
+
+    swallowed = _transient['suppressed']
+    extra = f" (+{swallowed} more suppressed)" if swallowed else ""
+    log.warning(f"Telegram API unreachable: {name}: {error}{extra} — "
+                f"retrying automatically, no action needed.")
+    _transient.update(name=name, suppressed=0, mute_until=now + TRANSIENT_ERROR_MUTE_S)
+
+# -------------------------------------------------------------------------------------------------
 # BOT
 
 application = Application.builder().token(TOKEN).build()
@@ -647,6 +716,7 @@ application.add_handler(CommandHandler("echantillons", samples))
 application.add_handler(CommandHandler("flash", flash))
 application.add_handler(CommandHandler("boards", board_status))
 application.add_handler(CommandHandler("help", help_command))
+application.add_error_handler(on_error)
 
 # TODO: add command handler /status
 log.info("Starting Telegram bot polling loop.")
