@@ -108,8 +108,8 @@ SSH) via `bossac`. Push a new binary + a `deploy/migrations/000N_flash_arduino_*
 migration to flash on deploy, or run `/flash` (admin only) on the Telegram bot to
 reflash the committed binary. Full workflow and recovery steps: `arduino/README.md`.
 
-**The Pi and the board share a versioned serial contract** — newline-delimited JSON over
-`/dev/ttyACM0`, one object per line each way, `proto = 2`. `sensors/read_puit.py` sends
+**The Pi and the board share a versioned serial contract** — newline-delimited JSON over the
+board's USB serial port, one object per line each way, `proto = 2`. `sensors/read_puit.py` sends
 `{"id":n,"cmd":"read_puit"}` and matches the reply by its echoed `id`; the board answers
 with the distance plus the four ping counts, or with an explicit error `code` instead of a
 silent `0`. The full contract (commands, parameters, every error code) lives in the
@@ -124,6 +124,17 @@ sensor ignores the trigger — power or wiring) and `out_of_range` (it answers b
 or obstructed) are **not** retried and notify the admins on Telegram, throttled to once per
 6 h per code since the scheduled run fires every 5 minutes; anything else is a bug in the
 request the Pi sent. Admins can see one burst ping-by-ping with `/echantillons`.
+
+**Which board is on which port is never assumed.** `/dev/ttyACM*` numbering is enumeration
+order, not identity, so the device node is resolved at open time from the USB product string
+the *firmware* advertises (`PiJardin Puit`), via the registry in `common/boards.py`. Identity
+therefore lives in the firmware image, not the hardware: swap the board for any other one,
+flash the same image, and it resolves identically — nothing on the Pi needs editing. The boot
+banner's `role` field is then checked against what the code expects, which is what catches a
+board carrying the wrong image (`wrong_board`). `/boards` (admin) shows how each board resolves; it
+never opens a port, so it is safe during a measurement and still reports a board whose
+firmware has hung. Until a board is reflashed with a descriptor-carrying image, resolution
+falls back to `/dev/ttyACM0` and logs a warning.
 
 `bossac` (`bossa-cli`) is installed automatically by `deploy/bootstrap.sh`. Flashing
 stops `sensors.timer` and takes the serial-port lock for ~1 min, then restarts it; the

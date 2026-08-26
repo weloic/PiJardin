@@ -21,6 +21,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, 'telegram_bot'))
 import alerts
+from common import boards
 from common.logging_setup import (
     setup_logging, attach_influx_handler, pi_version, arduino_version, grafana_version,
 )
@@ -47,9 +48,11 @@ except Exception as e:
     write_api = None
     query_api = None
 
-## Serial communication
-SERIAL_PORT = '/dev/ttyACM0'
-BAUD_RATE = 9600
+## Serial communication — which board this module drives. The device node is not a constant:
+## /dev/ttyACM* numbering is enumeration order, so it is resolved at open time from the USB
+## product string the firmware advertises (see common/boards.py), and the baud rate comes from
+## the same registry entry.
+BOARD = 'puit'
 
 ## Firmware serial contract — newline-delimited JSON, one object per line each way. The
 ## authority is the README of the firmware repo (PiJardin-Arduino_Software); the constants
@@ -175,6 +178,36 @@ def _check_proto(obj):
             'proto_mismatch', obj,
             message=f"Arduino speaks proto {proto!r}, this code speaks {PROTO} — flash the "
                     f"matching firmware (/flash) or update {os.path.basename(__file__)}.")
+
+
+def _check_board(banner, device):
+    """Confirm the firmware on `device` says it is the board this module drives.
+
+    The USB product string is what got us to this port, but that string is set at build time
+    and vouches for nothing about the image actually in the application slot. This checks the
+    running firmware's own answer, which is the only thing that can catch a board flashed
+    with another board's image — realistically, an env block copied in the firmware repo with
+    only one of its two role settings updated.
+
+    The firmware calls this field `role`; this module calls the concept `board`, because
+    `role` already means the admin/viewer permission level elsewhere in the project. The wire
+    name is the firmware's to choose, so it is read as-is rather than renamed.
+
+    Absent on firmware predating the field: warn and carry on rather than refuse, so this
+    code can be deployed before the board is reflashed. `PROTO` stays at 2 for the same
+    reason — adding a field is additive, and bumping it would force a flag-day reflash.
+    """
+    reported = banner.get('role')
+    if reported is None:
+        log.warning(
+            f"Firmware on {device} does not say which board it is, so its identity is "
+            f"unverified; flash a firmware built with -DPIJARDIN_ROLE to close this.")
+    elif reported != BOARD:
+        raise PuitPermanent(
+            'wrong_board', banner,
+            message=f"The board on {device} reports its role as {reported!r}, but this code "
+                    f"drives {BOARD!r} — either that board carries the wrong firmware, or the "
+                    f"wrong device was resolved. Refusing to record its readings as {BOARD!r}.")
 
 
 def _read_json_object(arduino, deadline):
@@ -377,15 +410,28 @@ def measure(arduino, cmd='read_puit', retries=3, delay=0.5, **params):
     raise last
 
 
-def open_arduino():
+def open_arduino(device=None):
+    """Open the board's serial port, reset it, and wait for it to identify itself.
+
+    device: an explicit node, bypassing resolution. Only the flasher passes this — it may be
+    talking to a board whose descriptor has not come back yet, or one targeted with --port
+    for recovery. Normal callers pass nothing and let the registry find the board.
+
+    Resolution happens here rather than at import time on purpose: the Telegram bot and the
+    flasher both import this module, and a module-level lookup would raise at import with the
+    board unplugged and take the bot down with it. Same reasoning as the lazy Influx client.
+    """
+    if device is None:
+        device = boards.resolve(BOARD)
+
     # Open with DTR deasserted, then assert it: the edge auto-resets the Arduino
     # deterministically. Relying on open() alone is not enough — whether it
     # produces a reset edge depends on the DTR state left by the previous
     # session, and an un-reset board serves a stale reading (frozen /mesure bug:
     # no boot banner in the journal, constant 61.00 response).
     arduino = serial.Serial()
-    arduino.port = SERIAL_PORT
-    arduino.baudrate = BAUD_RATE
+    arduino.port = device
+    arduino.baudrate = boards.config(BOARD)['baud']
     arduino.timeout = .1
     arduino.dtr = False
     arduino.open()
@@ -421,7 +467,9 @@ def open_arduino():
                             f"that does not speak JSON. /flash it.") from e
 
         _check_proto(banner)
-        log.info(f"Arduino ready: fw={banner.get('fw', '?')} proto={banner.get('proto')}")
+        _check_board(banner, device)
+        log.info(f"Arduino ready on {device}: role={banner.get('role', '?')} "
+                 f"fw={banner.get('fw', '?')} proto={banner.get('proto')}")
         return arduino
     except Exception:
         arduino.close()     # never leak the port when the handshake fails
@@ -838,7 +886,7 @@ if __name__ == '__main__':
         # sensor needs attention; the exit code is what systemd's OnFailure hook keys on.
         sys.exit(1)
     except Exception as e:
-        log.error(f"Could not open serial port {SERIAL_PORT}: {e}")
+        log.error(f"Could not open the {BOARD} board's serial port: {e}")
         sys.exit(1)
 
     if not db_ok:

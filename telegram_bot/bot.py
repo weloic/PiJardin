@@ -21,6 +21,7 @@ sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, 'sensors'))
 
 import read_puit
+from common import boards
 from common.logging_setup import setup_logging
 
 ## Configure logging first (stdout -> journald, line-buffered, httpx muzzled). The bot does
@@ -443,6 +444,54 @@ async def flash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in chunks[1:]:
         await update.message.reply_text(chunk)
 
+def _format_port(p):
+    """One line describing a USB serial port, as `describe()` reports it."""
+    ids = f"{p['vid']:04x}:{p['pid']:04x}" if p['vid'] is not None else "?"
+    product = html.escape(p['product'] or '?')
+    manufacturer = html.escape(p['manufacturer'] or '?')
+    return f"  <code>{html.escape(p['device'])}</code>  {ids}  {manufacturer} / {product}"
+
+async def board_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report which board resolves to which device node. Admin-only diagnostics.
+
+    Reads the USB layer only and never opens a port, so it is safe to run at any time,
+    including during a measurement — opening would assert DTR and reset the board. That
+    restriction is also what makes it useful: the SAMD21 USB stack is interrupt-driven, so a
+    board whose main loop has hung still shows up here, which is what separates "wedged" from
+    "unplugged". Firmware-level detail (fw, proto) comes from /mesure and /logs instead.
+    """
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    if user is None or user.get("banned") or user.get("role") != "admin":
+        await update.message.reply_text("Admin only.")
+        return
+
+    lines = []
+    for board in boards.boards():
+        info = boards.describe(board)
+        lines.append(f"<b>{html.escape(board)}</b> — attendu : "
+                     f"<code>{html.escape(info['usb_product'])}</code>")
+
+        if info['error']:
+            lines.append(f"  ❌ {html.escape(info['error'])}")
+        elif info['fallback_used']:
+            lines.append(f"  ⚠️ <code>{html.escape(info['device'])}</code> — repli : aucun "
+                         f"périphérique n'annonce cette chaîne. Reflasher la carte.")
+        else:
+            lines.append(f"  ✅ <code>{html.escape(info['device'])}</code>")
+
+        lines.extend(_format_port(p) for p in info['matches'])
+
+        # Only worth listing what else is on the bus when the board was not found by its
+        # descriptor — that is when knowing what *is* connected actually helps.
+        if (info['error'] or info['fallback_used']) and info['others']:
+            lines.append("  <i>Autres ports USB série :</i>")
+            lines.extend(_format_port(p) for p in info['others'])
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines).strip(), parse_mode="HTML")
+
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply with the tail of a service journal. Admin-only remote diagnostics."""
     chat_id = str(update.effective_chat.id)
@@ -553,6 +602,9 @@ HELP_ADMIN = (
     "                            valide, c'est la fenêtre qui\n"
     "                            était trop serrée, pas le capteur)</pre>"
     "<b>/flash</b> — reflashe le firmware Arduino (~1 min)\n"
+    "<b>/boards</b> — quelle carte est branchée sur quel port : chaîne USB attendue, port "
+    "résolu, et repli éventuel. N'ouvre jamais le port, donc sans risque pendant une mesure ; "
+    "une carte figée apparaît quand même comme présente\n"
     "<b>/logs</b> [bot|sensors|deploy] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
     "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"
     "<pre>/logs                       (15 dernières lignes du bot)\n"
@@ -593,6 +645,7 @@ application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
 application.add_handler(CommandHandler("echantillons", samples))
 application.add_handler(CommandHandler("flash", flash))
+application.add_handler(CommandHandler("boards", board_status))
 application.add_handler(CommandHandler("help", help_command))
 
 # TODO: add command handler /status
