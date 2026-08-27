@@ -150,8 +150,10 @@ flash the same image, and it resolves identically — nothing on the Pi needs ed
 banner's `role` field is then checked against what the code expects, which is what catches a
 board carrying the wrong image (`wrong_board`). `/boards` (admin) shows how each board resolves; it
 never opens a port, so it is safe during a measurement and still reports a board whose
-firmware has hung. Until a board is reflashed with a descriptor-carrying image, resolution
-falls back to `/dev/ttyACM0` and logs a warning.
+firmware has hung. If nothing advertises the expected string, resolution **fails** rather than
+guessing at `/dev/ttyACM0` — a guess that would open the wrong board once a second one exists.
+The registry supports a per-board `fallback` node for rolling back to a firmware without a
+product string; none is set, and it should stay that way outside such a rollback.
 
 `bossac` (`bossa-cli`) is installed automatically by `deploy/bootstrap.sh`. Flashing
 stops `sensors.timer` and takes the serial-port lock for ~1 min, then restarts it; the

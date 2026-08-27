@@ -13,9 +13,10 @@ compared with `==`, so a differing space or case just misses. Check with
 `python -c "from serial.tools import list_ports; print([p.product for p in list_ports.comports()])"`
 or `/boards`, which lists every other port it found precisely so a near-miss is obvious.
 
-`/dev/ttyACM*` numbering is enumeration order, not identity, so it is never an identifier —
-only the `fallback` below, covering the window between deploying this code and flashing a
-firmware that carries the descriptor.
+`/dev/ttyACM*` numbering is enumeration order, not identity, so it is never used as one. A board
+may name a `fallback` node for the window between deploying this code and flashing a firmware
+that carries the descriptor; no board sets one now, and the key is best left absent — with a
+second board attached, an unplugged board would let its fallback open the *other* one.
 
 Nothing is persisted or cached. Resolution is a dict lookup plus a scan of `/sys/class/tty`
 (a few ms of sysfs reads; no port is opened, so no board is disturbed), redone on every use.
@@ -34,7 +35,6 @@ log = logging.getLogger(__name__)
 BOARDS = {
     'puit': {
         'usb_product': 'PiJardin Puit',   # exact string set by board_build.usb_product (fw 2.2.0)
-        'fallback':    '/dev/ttyACM0',    # drop once the descriptor is confirmed in the field
         'baud':        9600,
         'proto':       2,
         'flash':       {'tool': 'bossac', 'offset': '0x2000', 'touch_baud': 1200},
@@ -78,14 +78,15 @@ def _usb_serial_ports():
 def resolve(board):
     """The device node for `board`, found by the product string its firmware advertises.
 
-    Degrades rather than failing outright: when nothing advertises the expected string but
-    the registry names a `fallback` node that exists, that node is used and a WARNING logged.
-    This is what lets this code be deployed *before* the board is reflashed — the Pi pulls and
-    hard-resets every 15 minutes, and the flash itself runs through code that calls this. Once
-    the warning stops appearing, the `fallback` key can be removed.
-
     Raises AmbiguousBoard rather than picking one when two ports claim the same board, and
-    BoardNotFound when there is nothing usable at all.
+    BoardNotFound when nothing advertises the expected string.
+
+    A board may name a `fallback` device node, used with a WARNING when nothing advertises its
+    string. No board sets one now — that was the escape hatch for deploying this code before
+    the firmware carried a descriptor, and leaving it in place permanently would reintroduce
+    the guess this module exists to remove. It stays supported for one case: rolling back to a
+    firmware with no product string, where adding the key back and pushing restores access
+    without needing a shell on the Pi.
     """
     cfg = config(board)
     want = cfg['usb_product']
