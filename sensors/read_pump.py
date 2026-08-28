@@ -172,6 +172,27 @@ class LinkSilent(PumpError):
 _request_id = itertools.count(1)
 
 
+## The board's millis() counter, for the wrap below.
+MS_WRAP = 2 ** 32
+
+
+def elapsed_ms(start_ms, end_ms):
+    """Milliseconds from `start_ms` to `end_ms` on the board's clock, or None.
+
+    Both are board `millis()` values, NOT durations — see the field table in the firmware's
+    docs/pump.md: `ms` is when the event happened and `prev_ms` is when the state being left
+    began. The board sends timestamps and lets the Pi subtract, which is lossless (a duration
+    can always be recovered, a timestamp cannot) but does put the 32-bit wrap on this side.
+    Modular arithmetic is what handles it: at ~49.7 days the counter rolls over, and a plain
+    subtraction would turn a two-minute run into a 49-day one.
+    """
+    if not isinstance(start_ms, (int, float)) or isinstance(start_ms, bool):
+        return None
+    if not isinstance(end_ms, (int, float)) or isinstance(end_ms, bool):
+        return None
+    return (int(end_ms) - int(start_ms)) % MS_WRAP
+
+
 def _read_json_object(port, deadline):
     """Return the next JSON object from the port, or None once `deadline` passes.
 
@@ -374,17 +395,18 @@ def write_run_point(state, start, duration_s, truncated=False):
 # -------------------------------------------------------------------------------------------------
 # RECORDING
 
-def record_transition(state, when, source, fields=None, prev_state=None, prev_ms=None,
-                      seq=None, uptime_ms=None, seq_missed=0):
+def record_transition(state, when, source, fields=None, prev_state=None, duration_s=None,
+                      truncated=False, seq=None, uptime_ms=None, seq_missed=0):
     """Write one state change, close out the state it ended, and advance the cursor.
 
-    `prev_ms` is computed on the board with unsigned arithmetic, so the millis() wrap is
-    handled once, in the firmware, and the duration is drift-free from its crystal rather
-    than from however busy this Pi happened to be.
+    `duration_s` is how long `prev_state` lasted, already computed by the caller — from the
+    board's own two timestamps on the live path (drift-free from its crystal, immune to
+    however busy this Pi happened to be) and by chaining transition times on the replay path,
+    where the board sends no timestamp for the state being left.
     """
     ok = True
-    if prev_state in STATES and isinstance(prev_ms, (int, float)) and prev_ms > 0:
-        ok = write_run_point(prev_state, when - prev_ms / 1000.0, prev_ms / 1000.0) and ok
+    if prev_state in STATES and isinstance(duration_s, (int, float)) and duration_s > 0:
+        ok = write_run_point(prev_state, when - duration_s, duration_s, truncated) and ok
 
     ok = write_state_point(state, when, source, fields, seq_missed) and ok
     if not ok:
@@ -563,12 +585,23 @@ def resync(port, status):
         if truncated:
             log.warning(f"The board's history buffer had already wrapped past seq {last_seq} "
                         f"— some pump cycles were never recorded and cannot be recovered.")
+        # A history entry is {seq, state, ms} and nothing else — the ring buffer does not
+        # store what each transition left behind, so unlike a live event there is no
+        # prev_state/prev_ms to read. Durations come from chaining instead: each replayed
+        # transition ends the state the one before it started, and the first ends whatever
+        # the cursor was holding when this service stopped.
+        chain_state = saved.get('state')
+        chain_when = saved.get('state_start')
         for event in events:
             when = anchor + event.get('ms', 0) / 1000.0
+            duration_s = (when - chain_when
+                          if isinstance(chain_when, (int, float)) and when > chain_when
+                          else None)
             record_transition(
                 event.get('state', 'unknown'), when, 'replay', event,
-                prev_state=event.get('prev_state'), prev_ms=event.get('prev_ms'),
+                prev_state=chain_state, duration_s=duration_s,
                 seq=event.get('seq'), uptime_ms=uptime_ms)
+            chain_state, chain_when = event.get('state'), when
             replayed += 1
         if replayed:
             log.info(f"Replayed {replayed} pump transition(s) missed while disconnected.")
@@ -657,10 +690,16 @@ def listen(port, seq, hb_interval_s):
 
         state = obj.get('state', 'unknown')
         if obj.get('ev') == 'pump':
+            # `ms` is when this transition was declared and `prev_ms` when the state being
+            # left began — two board timestamps, not a duration. Subtracting them here is
+            # the contract (docs/pump.md, and what pump_tune.py's `listen` prints).
+            held_ms = elapsed_ms(obj.get('prev_ms'), obj.get('ms'))
+            duration_s = held_ms / 1000.0 if held_ms is not None else None
             log.info(f"Pump {state} (rms={obj.get('rms_counts')} freq={obj.get('freq_hz')} "
-                     f"after {_format_since(obj.get('prev_ms'))} {obj.get('prev_state')})")
+                     f"after {_format_since(held_ms)} {obj.get('prev_state')})")
+            _check_duration(obj.get('prev_state'), duration_s, now)
             record_transition(state, now, 'event', obj,
-                              prev_state=obj.get('prev_state'), prev_ms=obj.get('prev_ms'),
+                              prev_state=obj.get('prev_state'), duration_s=duration_s,
                               seq=this_seq, uptime_ms=obj.get('ms'), seq_missed=seq_missed)
             _warn_on_health(obj)
         elif obj.get('ev') == 'hb':
@@ -670,6 +709,46 @@ def listen(port, seq, hb_interval_s):
             _warn_on_health(obj)
         else:
             log.warning(f"Unknown event kind {obj.get('ev')!r}: {obj}")
+
+
+## How far the board's duration may differ from what this process observed before it is worth
+## a line. The two are measured from different clocks and different instants — the board's
+## from its own declaration times, ours from when the lines arrived — so a second or two of
+## disagreement is normal. Anything larger is not a clock difference.
+DURATION_TOLERANCE_S = 5.0
+DURATION_TOLERANCE_FRAC = 0.05
+
+
+def _check_duration(prev_state, duration_s, when):
+    """Cross-check the board's duration against the one this daemon watched pass.
+
+    Two independent measurements of the same interval: the board subtracts its own
+    timestamps, and we hold the arrival time of the previous transition in the cursor. They
+    should agree to well inside a second.
+
+    This exists because reading `prev_ms` as a duration rather than a timestamp produced
+    runs 4.5x too long that looked entirely plausible in Grafana — the numbers were the right
+    order of magnitude and the state trace beside them was correct. Nothing downstream could
+    have caught it. A disagreement here is the cheap signal that one side's idea of the
+    contract has drifted from the other's, whichever side that turns out to be.
+    """
+    if duration_s is None:
+        return
+    saved = load_state()
+    if saved.get('state') != prev_state:
+        return          # the cursor is not tracking that state, so there is nothing to compare
+    start = saved.get('state_start')
+    if not isinstance(start, (int, float)):
+        return
+
+    observed = when - start
+    tolerance = max(DURATION_TOLERANCE_S, DURATION_TOLERANCE_FRAC * observed)
+    if abs(observed - duration_s) > tolerance:
+        log.warning(
+            f"The board says {prev_state!r} lasted {duration_s:.1f} s, but this service "
+            f"watched {observed:.1f} s pass since it started. One side is reading the "
+            f"ms/prev_ms contract differently — the recorded pump_run duration is the "
+            f"board's, and is wrong if the board is.")
 
 
 ## Counters that only mean something as a trend, so they are logged when they grow rather than

@@ -155,6 +155,15 @@ let the Pi recover the gap exactly.
   the board was away for part of it, so the value is a **lower bound**. Never treat a
   truncated run as an exact duration.
 
+  `duration_s` is derived, not read: on a live event the board sends two **timestamps**
+  (`ms`, when the transition was declared, and `prev_ms`, when the state being left began) and
+  the Pi subtracts them — modular arithmetic, because the board's `millis()` wraps at ~49.7
+  days. Replayed events carry no `prev_ms` at all (the ring buffer holds only
+  `{seq, state, ms}`), so there the duration comes from chaining consecutive transition times.
+  Every transition also cross-checks the board's duration against the interval this service
+  watched pass, and logs a WARNING if they disagree — reading `prev_ms` as a duration once
+  produced runs 4.5× too long that looked entirely plausible next to a correct state trace.
+
 **The cursor is durable.** `sensors/.pump_state.json` records the last event InfluxDB actually
 *accepted*, not the last line the serial port delivered, so a crash in between replays that
 line instead of losing it. Combined with the board's 32-entry history buffer, a Pi reboot or a
