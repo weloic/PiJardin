@@ -479,6 +479,9 @@ def connect():
                  f"fw={status.get('fw', '?')} proto={status.get('proto')} "
                  f"state={status.get('state')} since={_format_since(status.get('since_ms'))} "
                  f"seq={status.get('seq')}")
+        # A new connection knows nothing about what the board's counters did before it, so the
+        # first reading has to re-establish the baseline rather than be read as an increase.
+        _reset_health()
         return port, status
     except Exception:
         port.close()        # never leak the port when the handshake fails
@@ -762,19 +765,46 @@ _HEALTH_COUNTERS = {
                   "gain pot down. n_clipped cannot see this: on a 3V3 supply the flattening "
                   "happens well below the ADC rails",
 }
+## Last value seen for each counter, or None before the first reading of this connection.
+## Reset by _reset_health() on every connect — see why there rather than treating an unseen
+## counter as zero.
 _health_seen = {}
 
 
+def _reset_health():
+    """Forget the counter baselines, so the next reading re-establishes them."""
+    _health_seen.clear()
+
+
 def _warn_on_health(obj):
-    """Log the board's own counters when they increase. They reset when the board does."""
+    """Log the board's counters: at INFO when first seen, at WARNING when they grow.
+
+    The counters are cumulative since the BOARD's boot, and this process restarts far more
+    often than the board does — every deploy touching sensors/ or common/ bounces the unit.
+    So the first reading of a connection is a baseline to adopt, not a change to report: its
+    value may have accumulated entirely before this process was watching, and warning about it
+    would re-raise the same alarm on every deploy until the board next reboots.
+
+    That matters beyond tidiness. WARNING lines are written to InfluxDB as `log` points, so a
+    repeated false alarm both fills the database and teaches the reader to skim past exactly
+    the counter — n_headroom — that means the signal is degrading and the gain pot needs
+    turning down.
+    """
     for name, meaning in _HEALTH_COUNTERS.items():
         value = obj.get(name)
-        if not isinstance(value, int):
+        if not isinstance(value, int) or isinstance(value, bool):
             continue
-        previous = _health_seen.get(name, 0)
-        if value > previous:
+
+        previous = _health_seen.get(name)
+        if previous is None:
+            # First sighting on this connection. Non-zero is worth stating — it is real, and
+            # if it keeps climbing the next reading says so — but it is not news.
+            if value:
+                log.info(f"Pump board reports {name}={value} accumulated since its own boot "
+                         f"(baseline; not necessarily during this session).")
+        elif value > previous:
             log.warning(f"Pump board {name}={value} (+{value - previous}): {meaning}.")
-        # Assign unconditionally: a counter that went DOWN means the board rebooted, and the
+        # Assigned unconditionally: a counter that went DOWN means the board rebooted, and the
         # new value is the baseline to compare against from here.
         _health_seen[name] = value
 
