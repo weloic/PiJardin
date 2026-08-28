@@ -2,6 +2,7 @@
 arduino/older_firmware
 sensors/.puit_state.json
 sensors/.puit.lock
+sensors/.pump_state.json
 telegram_bot/.telegram_users.json
 telegram_bot/.alert_state.json
 deploy/.migrations_applied

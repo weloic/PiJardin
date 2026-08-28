@@ -66,9 +66,18 @@ if git diff --name-only "$OLD" "$NEW" | grep -qE "^sensors/"; then
     sudo systemctl restart --no-block sensors.service
 fi
 
+# Restart the pump listener when its code or the board registry changes. Unlike the oneshot
+# above this is a long-running process, so without a restart it keeps running the old code
+# indefinitely. The restart is safe at any moment: the board holds every transition in its
+# history buffer and this service replays what it missed on reconnect, so the seconds of
+# downtime cost nothing but a small delay in the points landing.
+if git diff --name-only "$OLD" "$NEW" | grep -qE "^sensors/|^common/"; then
+    sudo systemctl restart --no-block pump.service
+fi
+
 # Restart the bot if its code, the sensor module it imports, or the Python deps
 # changed (token picked up from .env automatically)
-if git diff --name-only "$OLD" "$NEW" | grep -qE "^telegram_bot/|^sensors/|^deploy/requirements.txt"; then
+if git diff --name-only "$OLD" "$NEW" | grep -qE "^telegram_bot/|^sensors/|^common/|^deploy/requirements.txt"; then
     sudo systemctl restart telegram-bot.service
 fi
 

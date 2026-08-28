@@ -40,6 +40,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now deploy.timer
 sudo systemctl enable --now sensors.timer
 sudo systemctl enable --now telegram-bot.service
+# Continuous listener for the pump board. Enabled unconditionally: with no board plugged in
+# it just logs "pump board not available" and backs off, which is the correct behaviour and
+# is visible in `/logs pump` — quieter than a unit nobody remembered to enable.
+sudo systemctl enable --now pump.service
 
 # Install Grafana provisioning config and seed dashboards
 GRAFANA_PROV_DIR="/etc/grafana/provisioning/dashboards"

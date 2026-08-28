@@ -9,7 +9,7 @@ Run once on a fresh Pi to register all systemd units and start the automation:
 bash ~/PiJardin/deploy/bootstrap.sh
 ```
 
-After that, `deploy.timer` pulls and redeploys the repo automatically every 15 minutes, and `sensors.timer` reads sensor data every 5 minutes on the clock.
+After that, `deploy.timer` pulls and redeploys the repo automatically every 15 minutes, and `sensors.timer` reads sensor data every 5 minutes on the clock. `pump.service` runs continuously instead of on a timer — see "Pump on/off" for why.
 
 ## Manual testing
 You can force data collection with:
@@ -42,7 +42,7 @@ Read logs on the Pi with `journalctl -u <unit>`, or remotely (admin only) via th
 `/logs` command:
 
 ```
-/logs [bot|sensors|deploy] [N | 2h|30m|3d] [since <t>] [until <t>]
+/logs [bot|sensors|deploy|pump] [N | 2h|30m|3d] [since <t>] [until <t>]
 ```
 
 - No argument → the last 15 lines of `telegram-bot.service` (a compact message).
@@ -70,9 +70,11 @@ project; the Telegram bot is an add-on and never writes to it):
   and by `flash_firmware.py` on a successful flash (`event=flash`). Fields: `pi_version`
   (repo git hash), `arduino_version` (`arduino/VERSION`), `grafana_version` (grafana/ subtree
   hash). Add it as a Grafana annotation query to overlay version changes on any panel.
-- **service down** — if `telegram-bot.service` fails, systemd's `OnFailure` hook
-  (`pijardin-onfailure@.service`) writes a `CRITICAL` `log` point (`source=<unit>`), so a dead
-  bot still leaves a trace even though it can't report on itself.
+- **`pump_state` / `pump_run` measurements** — the pump's on/off history, written by
+  `pump.service`. See "Pump on/off" below.
+- **service down** — if `telegram-bot.service` or `pump.service` fails, systemd's `OnFailure`
+  hook (`pijardin-onfailure@.service`) writes a `CRITICAL` `log` point (`source=<unit>`), so a
+  dead service still leaves a trace even though it can't report on itself.
 
 ## Telegram bot deploy
 Once .env is set, run following to deploy:
@@ -108,6 +110,68 @@ service restart. Drop a numbered script in `deploy/migrations/`; `deploy.sh` run
 one once and records it in the gitignored ledger `deploy/.migrations_applied`, so
 `git reset --hard` never re-runs it. See `deploy/migrations/README.md` for the
 convention.
+
+## Pump on/off
+
+A second board (XIAO **RP2040**, USB product string `PiJardin Pump`) watches for mains AC on
+the pump's switched feed with a ZMPT101B module, and reports when the pump starts and stops.
+`sensors/read_pump.py` records that history, run by `pump.service`.
+
+**It is a daemon, not a timer, and that is the design.** The well level is a value you fetch;
+the pump is an event. A 5-minute poll like `sensors.timer` would quantise every transition to
+5 minutes, miss any cycle shorter than that, and — the part that actually breaks it — have no
+way to know what it missed. So the board watches continuously and pushes; the Pi listens.
+
+**Who says what.** The Pi speaks exactly twice per connection and then goes quiet for weeks:
+
+1. It resolves the board (`common/boards.py`, by USB product string) and sends one `status`.
+   That answers *am I talking to the right board* (`proto` + `role`, same checks as the puit
+   board) and *what is its state now*.
+2. It sends `history after_seq=<last event in the DB>` and replays whatever it missed.
+3. From then on it sends **nothing**. The board emits a line on every debounced state change
+   and a heartbeat every 60 s; each one becomes a point.
+4. It speaks again only if the board goes silent for 3 heartbeats — the sole symptom a passive
+   listener has — and then reconnects with backoff.
+
+Opening the port does not disturb the board: DTR is asserted the way a terminal would, but on
+both PiJardin boards a reset needs the 1200-baud touch, not a DTR edge. That is what makes a
+restart of this service cheap — the board keeps counting, and `since_ms` + the history buffer
+let the Pi recover the gap exactly.
+
+**Two measurements**, both tagged `pump`:
+
+- **`pump_state`** — one point per transition *and* per heartbeat. Field `state` is an integer:
+  `1` on, `0` off, `-1` sensor fault, `-2` unknown. Filter `state >= 0` for the pump trace,
+  `state < 0` for the anomalies. Tag `source` says how the point was learned:
+  `event` (live), `heartbeat`, `replay` (drained from the board's ring buffer after a
+  reconnect), `resync` (back-dated from `since_ms`) or `reboot` (a gap marker). Also carries
+  `rms_counts`, `freq_hz`, `asym` and the board's own counters, plus `seq_missed` when lines
+  were lost.
+  **The heartbeat points are not filler**: without them "pump off for six hours" and "board
+  dead for six hours" are the same picture, and telling those apart is the point.
+- **`pump_run`** — one point per state that *ended*, timestamped at its **start**, with
+  `duration_s`. Runtime per day is a `sum`, cycles per day a `count` — no integrating a step
+  series. Tag `state` is the state that ended; tag `truncated` is `true` when the daemon or
+  the board was away for part of it, so the value is a **lower bound**. Never treat a
+  truncated run as an exact duration.
+
+**The cursor is durable.** `sensors/.pump_state.json` records the last event InfluxDB actually
+*accepted*, not the last line the serial port delivered, so a crash in between replays that
+line instead of losing it. Combined with the board's 32-entry history buffer, a Pi reboot or a
+deploy restart costs nothing — points land a minute late, timestamped correctly. The two
+things that cannot be recovered are always marked rather than guessed: a **board** reboot
+(its buffer went with it → an `unknown` gap marker + `truncated` runs) and a buffer that
+wrapped while the Pi was down longer than 32 transitions.
+
+Check it without SSH: `/pompe` on the Telegram bot (reads the state file, never the port —
+the daemon holds that open for its whole life), `/boards` for USB-level presence, and
+`/logs pump` for the journal.
+
+⚠️ **Flashing this board is not `/flash`.** It is an RP2040: its bootloader exposes no SAM-BA
+interface, only the `RPI-RP2` mass-storage drive, so `bossac` cannot touch it. `flash_firmware.py`
+refuses it explicitly (exit 7) rather than writing a SAMD21 image onto it. Flash it from the
+firmware repo with `tools/flash_uf2.py`. Anything that needs the port must
+`systemctl stop pump.service` first — a flock cannot wait out a holder that never lets go.
 
 ## Arduino firmware
 

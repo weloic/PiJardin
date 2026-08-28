@@ -23,6 +23,7 @@ sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, 'sensors'))
 
 import read_puit
+import read_pump
 from common import boards
 from common.logging_setup import setup_logging
 
@@ -108,6 +109,7 @@ LOG_UNITS = {
     "bot": "telegram-bot.service",
     "sensors": "sensors.service",
     "deploy": "deploy.service",
+    "pump": "pump.service",
 }
 LOG_DEFAULT_LINES = 15   # compact default tail when no line count / time range is given
 LOG_MESSAGE_MAX_LINES = 15  # above this many lines, deliver as a .txt file instead of a message
@@ -283,6 +285,66 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db_ok:
         text += "\n⚠️ Could not write to InfluxDB — value NOT recorded in the database."
     await msg.edit_text(text)
+
+## How each pump state reads to a human. `fault` is deliberately not "arrêtée": the module
+## stopped reporting, so the pump's state is unknown — and a disconnected signal wire and a
+## stopped pump produce the same low reading, which is exactly the confusion to avoid here.
+PUMP_STATE_TEXT = {
+    "on":      "🟢 La pompe tourne",
+    "off":     "⚪ La pompe est arrêtée",
+    "fault":   "🚨 Capteur en défaut — état de la pompe inconnu (câble de signal, module)",
+    "unknown": "❔ État inconnu (la carte vient de démarrer)",
+}
+
+def _format_duration_fr(seconds):
+    """A duration in French, at the coarsest unit that still says something useful."""
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    if seconds < 86400:
+        return f"{seconds // 3600} h {(seconds % 3600) // 60:02d}"
+    return f"{seconds // 86400} j {(seconds % 86400) // 3600} h"
+
+async def pompe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report what the pump is doing, from the listener's own record.
+
+    Reads the state file pump.service writes after every recorded line — it never opens the
+    serial port, and could not: the listener holds that port open for its whole life. So this
+    answers instantly, works while the board is unplugged, and cannot disturb the detector.
+
+    The cost is that it reports a memory rather than a fresh observation, which is why `age`
+    is shown whenever it is stale: a state nobody has confirmed for minutes is exactly the
+    case where the number on its own would mislead.
+    """
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    # Any registered role (admin or viewer); banned entries have no role.
+    if user is None or user.get("banned") or not user.get("role"):
+        await update.message.reply_text("You need to register first: /start <password>")
+        return
+
+    info = await asyncio.to_thread(read_pump.current_state)
+    if info is None:
+        await update.message.reply_text(
+            "Aucune donnée de pompe enregistrée pour l'instant.\n"
+            "Le service vient peut-être de démarrer, ou la carte n'est pas détectée "
+            "(voir /boards et /logs pump).")
+        return
+
+    text = PUMP_STATE_TEXT.get(info["state"], f"État : {info['state']}")
+    if info["since_s"] is not None:
+        text += f" depuis {_format_duration_fr(info['since_s'])}"
+
+    if info["stale"]:
+        text += (f"\n\n⚠️ Dernier signe de vie de la carte il y a "
+                 f"{_format_duration_fr(info['age_s'])} — l'état ci-dessus est le dernier "
+                 f"connu, pas une mesure actuelle. Voir /logs pump.")
+    await update.message.reply_text(text)
 
 async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title, autoscale_y=False):
     """Query the volume history for `range_start` and reply with a rendered chart."""
@@ -588,6 +650,8 @@ HELP_GENERAL = (
     "<b>Commandes PiJardin</b>\n"
     "\n"
     "<b>/mesure</b> — mesure le niveau du puits maintenant (alias <b>/measure</b>)\n"
+    "<b>/pompe</b> — la pompe tourne-t-elle, et depuis combien de temps ; signale si la "
+    "carte ne donne plus signe de vie (alias <b>/pump</b>)\n"
     "<b>/alertes</b> [on|off] — active/désactive les alertes de volume bas ; "
     "sans argument, affiche l'état actuel et les seuils\n"
     "<b>/graphe24h</b> · <b>/graphe3j</b> · <b>/graphe7j</b> — graphique du volume "
@@ -615,11 +679,12 @@ HELP_ADMIN = (
     "<b>/boards</b> — quelle carte est branchée sur quel port : chaîne USB attendue, port "
     "résolu, et repli éventuel. N'ouvre jamais le port, donc sans risque pendant une mesure ; "
     "une carte figée apparaît quand même comme présente\n"
-    "<b>/logs</b> [bot|sensors|deploy] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
+    "<b>/logs</b> [bot|sensors|deploy|pump] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
     "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"
     "<pre>/logs                       (15 dernières lignes du bot)\n"
     "/logs sensors 50           (50 dernières lignes)\n"
     "/logs bot 2h               (2 dernières heures)\n"
+    "/logs pump 30              (écoute de la pompe)\n"
     "/logs deploy since 10:00 until 11:00</pre>"
 )
 
@@ -711,6 +776,7 @@ application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("alertes", alerts))
 application.add_handler(CommandHandler(["mesure", "measure"], measure))
+application.add_handler(CommandHandler(["pompe", "pump"], pompe))
 application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))

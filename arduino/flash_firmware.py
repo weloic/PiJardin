@@ -16,8 +16,9 @@ Procedure:
 Exit codes: 0 OK or WARN (bossac verified the write; readback is only an extra
 health check, so a WARN still exits 0 to avoid re-flashing an already-verified
 binary), 1 no firmware, 2 no bootloader port, 3 bossac failed, 5 serial port busy,
-6 board not found on the USB bus. Every path prints one final line starting
-"FLASH OK|WARN|FAIL:" for the bot / journal to relay.
+6 board not found on the USB bus, 7 the target board is not flashed with bossac.
+Every path prints one final line starting "FLASH OK|WARN|FAIL:" for the bot /
+journal to relay.
 
 Usage:  python flash_firmware.py [--notify-admins] [--port /dev/ttyACM0]
 
@@ -218,6 +219,17 @@ def _do_flash(port, forced_port):
 
 def main(notify_admins=False, port=None):
     setup_logging()
+
+    # 0. This flasher drives bossac and nothing else. Guarded rather than assumed, because the
+    #    registry now holds a board it cannot flash: the pump board is an RP2040 whose
+    #    bootloader exposes no SAM-BA interface, only the RPI-RP2 mass-storage drive. Asking
+    #    bossac to write a SAMD21 image at offset 0x2000 of an RP2040 would be a confident,
+    #    silent mistake, and BOARD is one edit away from pointing at it.
+    tool = boards.config(BOARD).get('flash', {}).get('tool')
+    if tool != 'bossac':
+        return _finish(7, f"FLASH FAIL: the {BOARD!r} board is flashed with {tool!r}, not "
+                          f"bossac — this script only speaks bossac. Flash it from the "
+                          f"firmware repo instead (tools/flash_uf2.py).", notify_admins)
 
     # 1. Fail fast before any side effect if there is nothing to flash.
     if not os.path.isfile(FIRMWARE_BIN) or os.path.getsize(FIRMWARE_BIN) == 0:

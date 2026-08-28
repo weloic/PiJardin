@@ -39,6 +39,20 @@ BOARDS = {
         'proto':       2,
         'flash':       {'tool': 'bossac', 'offset': '0x2000', 'touch_baud': 1200},
     },
+    'pump': {
+        # The firmware calls this role 'pump', not 'pompe'. The string is protocol — the
+        # board puts it in every line it emits and sensors/read_pump.py compares it — so it
+        # is not translated here even though the Telegram command that surfaces it is French.
+        'usb_product': 'PiJardin Pump',   # board_build.arduino.earlephilhower.usb_product
+        'baud':        9600,
+        'proto':       2,
+        # This is an RP2040, NOT the SAMD21 the puit board uses. Its bootloader exposes no
+        # SAM-BA interface, so bossac cannot touch it; images are .uf2 files copied to the
+        # RPI-RP2 mass-storage drive the bootloader presents. arduino/flash_firmware.py
+        # refuses any board whose tool is not 'bossac' rather than trying anyway — writing a
+        # SAMD21 image at offset 0x2000 of an RP2040 would be a confident, silent mistake.
+        'flash':       {'tool': 'uf2'},
+    },
 }
 
 

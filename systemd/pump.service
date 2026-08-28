@@ -1,0 +1,44 @@
+# A .service unit describes how to run a program.
+#
+# This one is a persistent process, NOT a timer — and that is the whole design. The pump's
+# state is an event, not a value to fetch: a timer firing every 5 minutes like sensors.timer
+# would quantise every transition to 5 minutes and miss whole cycles. The board watches
+# continuously and pushes; this process listens.
+#
+# It holds /dev/ttyACM* open for its entire life, so anything else needing that port (a
+# reflash) must stop this unit first — a flock cannot wait out a holder that never lets go.
+#
+# NOTE: @@PLACEHOLDER@@ tokens are substituted by deploy/bootstrap.sh at install time.
+
+[Unit]
+Description=Record pump on/off transitions from the pump board
+# The board is USB, not network — but InfluxDB is reached over localhost HTTP, and starting
+# before the stack is up just burns the first reconnect backoff.
+After=network-online.target
+# When this unit enters its failed state, record it in InfluxDB. %n expands to this unit's
+# name, passed to the handler as its instance. A listener that dies silently would otherwise
+# look exactly like a pump that never ran.
+OnFailure=pijardin-onfailure@%n.service
+
+[Service]
+# simple means: the process is the listener itself; systemd tracks it as long as it runs.
+Type=simple
+
+# Inject all variables from .env (including secrets) into the process environment.
+EnvironmentFile=@@REPO_DIR@@/.env
+
+ExecStart=@@VENV_DIR@@/bin/python3 @@REPO_DIR@@/sensors/read_pump.py
+
+# Run as the unprivileged user instead of root, for security. The user must be in the
+# `dialout` group to open the serial port (already the case for the puit board).
+User=@@SERVICE_USER@@
+
+# Restart on any exit, not just failure. The listener has no successful end state: if it
+# returns at all, something stopped it and it should come back. Its own reconnect loop
+# already handles an absent or wedged board, so reaching this line means something more
+# unusual — and 30 s keeps a crash loop out of the journal.
+Restart=always
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
