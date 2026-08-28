@@ -692,11 +692,15 @@ def write_influx_measurement(heigth_median, resampled=False, resp=None):
         log.warning("No InfluxDB write API; measurement not recorded.")
         return False
 
-    # Timestamp rounded to the nearest 5 minutes; must be UTC-aware because the
-    # client interprets naive datetimes as UTC
-    rounded = roundTime(datetime.datetime.now(datetime.timezone.utc), roundTo=300)
+    # The instant the reading was taken, not a slot it was snapped into. Points used to be
+    # rounded to the nearest 5 minutes to match the scheduled cadence, which was fine while
+    # every reading came from the timer — but a /mesure between two scheduled runs was then
+    # recorded as if it had happened at :05 or :10, and one landing in the same slot as the
+    # timer's own run overwrote it (same measurement, same tags, same timestamp is an
+    # overwrite in InfluxDB). Must be UTC-aware: the client reads a naive datetime as UTC.
+    when = datetime.datetime.now(datetime.timezone.utc)
 
-    log.info(f'Write influxdb time {rounded.isoformat()}')
+    log.info(f'Write influxdb time {when.isoformat()}')
     # Create a data point for InfluxDB. lenght_median (cm) is the field the Grafana
     # dashboards read; the rest is diagnosis and future repair.
     point = (
@@ -708,7 +712,7 @@ def write_influx_measurement(heigth_median, resampled=False, resp=None):
         value = (resp or {}).get(name)
         if isinstance(value, (int, float)):
             point.field(name, cast(value))
-    point.time(rounded, WritePrecision.S)
+    point.time(when, WritePrecision.S)
 
     # Write data to InfluxDB
     try:
@@ -860,17 +864,6 @@ def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):
 
     return _with_arduino(lock_timeout, action)
 
-
-def roundTime(dt=None, roundTo=60):
-   """Round a datetime object to any time lapse in seconds
-   dt : datetime.datetime object, default now.
-   roundTo : Closest number of seconds to round to, default 1 minute.
-   Author: Thierry Husson 2012 - Use it as you want but don't blame me.
-   """
-   if dt == None : dt = datetime.datetime.now()
-   seconds = (dt.replace(tzinfo=None) - dt.min).seconds
-   rounding = (seconds+roundTo/2) // roundTo * roundTo
-   return dt + datetime.timedelta(0,rounding-seconds,-dt.microsecond)
 
 # -------------------------------------------------------------------------------------------------
 # SCHEDULING

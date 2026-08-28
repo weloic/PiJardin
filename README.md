@@ -56,7 +56,8 @@ attachment (no truncation).
 
 **InfluxDB records the measurements plus only serious events** (the DB is for managing the
 project; the Telegram bot is an add-on and never writes to it):
-- **`height_measure` measurement** — one point per reading, timestamp rounded to 5 min, tag
+- **`height_measure` measurement** — one point per reading, timestamped at the moment it was
+  taken (so an on-demand `/mesure` lands where it happened rather than on the 5-min grid), tag
   `resampled`. Field `lenght_median` is the distance in cm the Grafana dashboards read; the
   rest is health and future repair, all from the same burst: `pulse_us` (the raw echo width,
   the only thing the board actually measures) and `temp_c` (the air temperature it was
