@@ -194,12 +194,18 @@ def elapsed_ms(start_ms, end_ms):
 
 
 def _read_json_object(port, deadline):
-    """Return the next JSON object from the port, or None once `deadline` passes.
+    """Return the next JSON object from the port, or None on `deadline` or on shutdown.
 
     Anything that is not a JSON object is noise on a line-delimited JSON link (a truncated
     line, boot chatter) — log it and keep reading, because the line we want may be behind it.
+
+    `_stopping` is checked every pass, so a SIGTERM is noticed within one readline timeout
+    (1 s) instead of at the deadline. In the listen loop that deadline is the 180 s silence
+    window, so without this the process sat here until the next heartbeat happened to arrive:
+    a measured 47 s stop on a healthy link, and past systemd's 90 s TimeoutStopSec — i.e. a
+    SIGKILL instead of a clean exit — on a link that had already gone quiet.
     """
-    while time.time() < deadline:
+    while time.time() < deadline and not _stopping:
         raw = port.readline()
         if not raw:
             continue                       # readline() timeout, not end of stream
@@ -649,9 +655,10 @@ def _close_truncated(saved):
 # LISTEN
 
 def listen(port, seq, hb_interval_s):
-    """Read and record until the link goes quiet or the board restarts. Never returns normally.
+    """Read and record until the link goes quiet, the board restarts, or we are stopping.
 
     This is the whole steady state of the service: no requests, no polling, one blocking read.
+    Returns only on shutdown; every other way out is an exception the reconnect loop handles.
     """
     silence_s = SILENCE_FACTOR * hb_interval_s
     expected_seq = seq
@@ -660,6 +667,10 @@ def listen(port, seq, hb_interval_s):
         deadline = time.time() + silence_s
         obj = _read_json_object(port, deadline)
         if obj is None:
+            # Two ways to get here, and they must not be confused: a shutdown is a clean
+            # return, while a genuinely quiet link is the one symptom this listener has.
+            if _stopping:
+                return
             raise LinkSilent(f"no line from the pump board for {silence_s:.0f} s "
                              f"({SILENCE_FACTOR} missed heartbeats)")
 
@@ -886,7 +897,11 @@ def run():
             backoff = min(backoff * 2, BACKOFF_MAX_S)
 
         except (LinkSilent, PumpError) as e:
-            log.warning(f"Pump link lost: {e}")
+            # A request abandoned mid-flight because we are shutting down is not a fault, and
+            # saying so would put a misleading WARNING (and an InfluxDB `log` point) in the
+            # journal on every ordinary deploy.
+            if not _stopping:
+                log.warning(f"Pump link lost: {e}")
             backoff = min(backoff * 2, BACKOFF_MAX_S)
 
         except serial.SerialException as e:
