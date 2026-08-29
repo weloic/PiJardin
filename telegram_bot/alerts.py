@@ -44,6 +44,20 @@ def alert_recipients():
         if user.get("alerts") and user.get("role") and not user.get("banned")
     ]
 
+def pump_recipients():
+    """Who wants a note after each pump cycle. Opt-in, separate from the volume alerts.
+
+    A different question from `alerts`: that one is "tell me when the cistern is running dry",
+    this one is "tell me what every cycle cost". Someone may well want one and not the other.
+    Any role, admins included — it is a report, not an operation.
+    """
+    return [
+        chat_id
+        for chat_id, user in load_users().items()
+        if user.get("pump_notify") and user.get("role") and not user.get("banned")
+    ]
+
+
 def admin_recipients():
     """Admins receive ops notifications (e.g. deploys) regardless of their
     water-level alert opt-in, which only governs the volume-threshold alerts."""
@@ -143,6 +157,41 @@ def send_telegram(chat_ids, text):
             log.info(f"Alert sent to chat {chat_id}.")
         except Exception as e:
             log.error(f"Could not send alert to chat {chat_id}: {e}")
+
+# -------------------------------------------------------------------------------------------------
+# PUMP CYCLE NOTIFICATION
+
+def notify_pump_run(volume_l, sigma_l, duration_s, rate_l_per_h, quality):
+    """Tell the opted-in users what the cycle that just finished cost, in litres.
+
+    Sent from sensors/pump_volume.py, which runs inside pump.service — not the bot process — so
+    it goes out over the HTTP API like every other notification here.
+
+    Sent once per run, when it is first costed, seconds after the pump stops. A run is costed a
+    second time later (see pump_volume.sweep) once the reading that vouches for its closing level
+    exists; that recheck deliberately does NOT notify again, because two messages about one cycle
+    would be worse than a number that improves quietly.
+    """
+    recipients = pump_recipients()
+    if not recipients:
+        return
+
+    minutes = duration_s / 60.0
+    text = (f"💧 Cycle de pompage terminé ({minutes:.0f} min)\n"
+            f"Eau utilisée / perdue : {volume_l:.0f} L")
+    if sigma_l is not None:
+        text += f" ± {sigma_l:.0f}"
+        if sigma_l >= abs(volume_l):
+            # Below the sensor's resolution. Saying "3 L" here would invent a precision the
+            # measurement does not have, and this is the case a closed loop lands in.
+            text += "\n(trop faible pour être mesuré : dans le bruit)"
+    if rate_l_per_h is not None:
+        text += f"\nDébit moyen : {rate_l_per_h:.0f} L/h"
+    if quality == 'degraded':
+        text += "\n⚠️ Mesure peu fiable."
+
+    text += "\n\n/pertes pour l'historique, /pertes off pour arrêter ces messages."
+    send_telegram(recipients, text)
 
 # -------------------------------------------------------------------------------------------------
 # DEPLOY NOTIFICATION

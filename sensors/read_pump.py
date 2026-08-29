@@ -756,7 +756,9 @@ def _sweep_volumes():
     if pump_volume is None:
         return
     try:
-        written, skipped = pump_volume.sweep(SWEEP_WINDOW_S, settle_s=0)
+        # notify=True only here: this is the one caller for which a newly costed run means "the
+        # pump has just stopped", which is what the message says.
+        written, skipped = pump_volume.sweep(SWEEP_WINDOW_S, settle_s=0, notify=True)
     except Exception as e:
         # The next pump stop sweeps again and finds this run still unanswered, so a failure
         # here costs a delay, not a number. Losing the listener would cost the number.

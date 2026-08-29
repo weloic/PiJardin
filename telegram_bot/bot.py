@@ -371,11 +371,27 @@ async def pertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pump is idle.
     """
     chat_id = str(update.effective_chat.id)
-    user = load_users().get(chat_id)
+    users = load_users()
+    user = users.get(chat_id)
 
     # Any registered role (admin or viewer); banned entries have no role.
     if user is None or user.get("banned") or not user.get("role"):
         await update.message.reply_text("You need to register first: /start <password>")
+        return
+
+    # /pertes on|off toggles the per-cycle message; /pertes on its own shows the history. One
+    # command per subject, the same shape as /alertes.
+    if context.args:
+        choice = context.args[0].lower()
+        if choice not in ("on", "off"):
+            await update.message.reply_text("Usage: /pertes [on|off]")
+            return
+        user["pump_notify"] = (choice == "on")
+        save_users(users)
+        await update.message.reply_text(
+            "Notifications de pompage activées : un message après chaque cycle."
+            if choice == "on" else
+            "Notifications de pompage désactivées.")
         return
 
     try:
@@ -420,8 +436,10 @@ async def pertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {when} — {_format_duration_fr(duration)} : {detail}"
                      f"{PERTES_QUALITY_FR.get(row.get('quality'), '')}")
 
-    lines.append("\n<i>≈ mesure approximative, ⚠️ peu fiable. En circuit fermé, ce chiffre "
-                 "est la perte du circuit.</i>")
+    state = "activées" if user.get("pump_notify") else "désactivées"
+    lines.append(f"\n<i>≈ mesure approximative, ⚠️ peu fiable. En circuit fermé, ce chiffre "
+                 f"est la perte du circuit.\nNotifications par cycle : {state} "
+                 f"(/pertes on|off).</i>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title, autoscale_y=False):
@@ -730,8 +748,9 @@ HELP_GENERAL = (
     "<b>/mesure</b> — mesure le niveau du puits maintenant (alias <b>/measure</b>)\n"
     "<b>/pompe</b> — la pompe tourne-t-elle, et depuis combien de temps ; signale si la "
     "carte ne donne plus signe de vie (alias <b>/pump</b>)\n"
-    "<b>/pertes</b> — eau utilisée ou perdue lors des derniers cycles de pompage, "
-    "mesurée sur le niveau du puits (en circuit fermé : les pertes du circuit)\n"
+    "<b>/pertes</b> [on|off] — eau utilisée ou perdue lors des derniers cycles de pompage, "
+    "mesurée sur le niveau du puits (en circuit fermé : les pertes du circuit). "
+    "<b>on</b>/<b>off</b> active ou coupe le message envoyé après chaque cycle\n"
     "<b>/alertes</b> [on|off] — active/désactive les alertes de volume bas ; "
     "sans argument, affiche l'état actuel et les seuils\n"
     "<b>/graphe24h</b> · <b>/graphe3j</b> · <b>/graphe7j</b> — graphique du volume "

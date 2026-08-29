@@ -195,7 +195,10 @@ the daemon holds that open for its whole life), `/boards` for USB-level presence
 
 `sensors/pump_volume.py` turns each finished pump run into a volume in litres and records it as
 `pump_volume`. The Grafana table **« Eau utilisée / perdue — 3 derniers cycles de pompage »** and
-the Telegram command **`/pertes`** are the two views of it.
+the Telegram command **`/pertes`** are the two views of it, and **`/pertes on`** adds a message
+after every cycle saying what it cost. That message is sent once, when the run is first costed —
+the recheck below deliberately stays quiet rather than sending a second message about one cycle —
+and never for a backfill, which would announce a week of old runs at once.
 
 **There is no timer.** `read_pump.py` calls the sweep as soon as it has written the level reading
 forced at a pump stop, so a run is costed within seconds of ending. What makes that safe is that
@@ -265,7 +268,12 @@ reported as −35 L instead of +10 L. The rate is measured per run from the quie
 
 **Every point says how far to trust it.** `volume_sigma_l` is the uncertainty — the level moves
 40 litres per centimetre, so a small enough loss is indistinguishable from sensor noise, and this
-says so out loud instead of printing a confident number. Tag `quality` is `ok` (both forced
+says so out loud instead of printing a confident number. The sensor's own noise is measured per
+sweep from successive differences of the quiet stretches, and the median is tried first but is
+usually **zero**: the sensor is quantised and the cistern is still, so most consecutive readings
+come back identical. That is not "no information", it is "the noise is below the step size", so a
+zero median falls through to the mean rather than to the pessimistic `FALLBACK_SIGMA_CM`. Getting
+that wrong put 1 cm (40 L) on every run and made every number meaningless. Tag `quality` is `ok` (both forced
 readings used and vouched for by their neighbours), `coarse` (one was rejected, absent, or had no
 neighbours to check it against), or `degraded` (a `truncated` run, whose duration is itself only
 a lower bound).

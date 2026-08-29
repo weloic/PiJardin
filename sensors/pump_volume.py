@@ -74,6 +74,16 @@ sys.path.insert(0, _REPO)
 ## dashboards spell the conversion out and this one does not.
 import read_puit
 
+## Telegram notifications. Guarded: a sweep that cannot tell anyone the answer must still record
+## it, so a missing or broken bot module costs the message and nothing else.
+sys.path.insert(0, os.path.join(_REPO, 'telegram_bot'))
+try:
+    import alerts
+except Exception as _e:                # noqa: BLE001 - anything here means "no notifications"
+    alerts = None
+    logging.getLogger('pump_volume').warning(
+        f"Could not import alerts ({_e}); pump cycles will not be notified.")
+
 from common.logging_setup import setup_logging, attach_influx_handler
 
 log = logging.getLogger('pump_volume')
@@ -190,21 +200,38 @@ def _median(values):
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
+## Turning a spread of successive differences into a standard deviation. If consecutive readings
+## carry independent noise of sigma, their difference has sigma*sqrt(2), and for normal noise
+## median|d| = 0.6745*sigma*sqrt(2) and mean|d| = 0.7979*sigma*sqrt(2). Dividing by these
+## recovers sigma. Differencing first is what makes this work on a level that is drifting.
+_MEDIAN_TO_SIGMA = 1.0 / (0.6745 * math.sqrt(2.0))
+_MEAN_TO_SIGMA = 1.0 / (0.7979 * math.sqrt(2.0))
+
+
 def pooled_sigma_cm(samples):
     """Estimate the sensor's noise from successive differences of a quiet series, in cm.
 
-    sigma = MAD(differences) / sqrt(2), rescaled. Differencing removes any slow drift, which is
-    what makes this usable on a level series that is genuinely moving; the sqrt(2) undoes the
-    variance a difference of two independent readings adds. Returns None when there is not
-    enough to say, and the caller falls back to FALLBACK_SIGMA_CM.
+    The median is the robust estimator and is tried first. But this sensor is QUANTISED and the
+    cistern is usually still, so most consecutive readings come back byte-identical and the
+    median of the differences is exactly zero — which is not "no information", it is "the noise
+    is smaller than the step size". Measured on the real series: 453 quiet samples, median 0.
+
+    So a zero median falls through to the mean, which the handful of readings that did move still
+    move off zero. Only if literally every reading is identical is there nothing to say, and then
+    the caller uses FALLBACK_SIGMA_CM.
     """
     diffs = [abs(samples[i + 1][1] - samples[i][1]) for i in range(len(samples) - 1)]
     if len(diffs) < 4:
         return None
-    mad = _median(diffs)
-    if mad is None or mad <= 0:
-        return None
-    return 1.4826 * mad / math.sqrt(2.0)
+
+    median = _median(diffs)
+    if median is not None and median > 0:
+        return median * _MEDIAN_TO_SIGMA
+
+    mean = sum(diffs) / len(diffs)
+    if mean > 0:
+        return mean * _MEAN_TO_SIGMA
+    return None
 
 
 # -------------------------------------------------------------------------------------------------
@@ -445,37 +472,56 @@ def query_computed(since, until):
     return done
 
 
+## Numbers on a costed run, and the one text field beside them. Read apart, deliberately — see
+## query_recent.
+RECENT_NUMERIC = ('volume_l', 'rate_l_per_h', 'volume_sigma_l', 'duration_s')
+
+
 def query_recent(limit=5, since='-30d'):
     """The last `limit` costed runs, newest last. Returns [{'time', 'quality', <fields>}].
 
-    For /pertes on the Telegram bot and for anything else that wants the numbers without
-    recomputing them. group() before pivot so the fields land on one table and tail() counts
-    runs rather than series.
+    TWO queries, because `quality` is a string and everything else is a float. Flux gives each
+    _field its own table, and a column can hold only one type — so folding them into a single
+    `_value` column (a keep() plus a group(), which is the obvious way to write this) is a schema
+    collision that fails at query time, not at write time. Reading the text separately and
+    matching on the timestamp cannot collide, and this is a Telegram command, not a hot path.
     """
     if query_api is None:
         return []
-    wanted = ('volume_l', 'rate_l_per_h', 'volume_sigma_l', 'duration_s', 'quality')
-    predicate = ' or '.join(f'r._field == "{name}"' for name in wanted)
-    flux = (
+
+    predicate = ' or '.join(f'r._field == "{name}"' for name in RECENT_NUMERIC)
+    numeric = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {since})\n'
         '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
         f'  |> filter(fn: (r) => {predicate})\n'
-        '  |> keep(columns: ["_time", "_field", "_value"])\n'
-        '  |> group()\n'
         '  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")\n'
         '  |> sort(columns: ["_time"])\n'
         f'  |> tail(n: {int(limit)})'
     )
-    rows = []
-    for table in query_api.query(flux, org=INFLUXDB_ORG):
+    text = (
+        f'from(bucket: "{INFLUXDB_BUCKET}")\n'
+        f'  |> range(start: {since})\n'
+        '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
+        '  |> filter(fn: (r) => r._field == "quality")\n'
+        '  |> keep(columns: ["_time", "_value"])\n'
+        '  |> sort(columns: ["_time"])'
+    )
+
+    qualities = {}
+    for table in query_api.query(text, org=INFLUXDB_ORG):
         for record in table.records:
-            row = {'time': record.get_time()}
-            for name in wanted:
+            qualities[record.get_time()] = record.get_value()
+
+    rows = []
+    for table in query_api.query(numeric, org=INFLUXDB_ORG):
+        for record in table.records:
+            row = {'time': record.get_time(), 'quality': qualities.get(record.get_time())}
+            for name in RECENT_NUMERIC:
                 row[name] = record.values.get(name)
             rows.append(row)
     rows.sort(key=lambda r: r['time'])
-    return rows
+    return rows[-int(limit):]
 
 
 def write_volume_point(start, fields, quality):
@@ -519,12 +565,16 @@ def _between(samples, start, end):
 TAIL_S = 10 * 60
 
 
-def sweep(since_s, recompute=False, now=None, settle_s=SETTLE_S):
+def sweep(since_s, recompute=False, now=None, settle_s=SETTLE_S, notify=False):
     """Compute every ON run in the window that has no volume yet. Returns (written, skipped).
 
     Asking "which runs have no volume?" of the database rather than remembering it is what makes
     this safe to call from anywhere and as often as you like: it backfills, it recovers whatever
     a restart interrupted, and calling it twice does nothing the second time.
+
+    `notify` sends a Telegram message for each run costed for the FIRST time. Only read_pump.py
+    passes it, because only there does a costed run mean "the pump has just stopped". A manual
+    sweep or a backfill would otherwise announce a week of old cycles at once.
     """
     if query_api is None:
         log.error("No InfluxDB query API; cannot compute pump volumes.")
@@ -594,6 +644,17 @@ def sweep(since_s, recompute=False, now=None, settle_s=SETTLE_S):
             log.info(f"Run at {_rfc3339(t0)} lasting {duration_s / 60:.1f} min moved "
                      f"{fields['volume_l']:.0f} +/- {fields['volume_sigma_l']:.0f} L "
                      f"({fields['rate_l_per_h']:.0f} L/h, {quality}).")
+
+            ## Only when this run had no point before: the recheck below writes it a second
+            ## time, and two messages about one cycle would be worse than a quiet improvement.
+            ## `notify` is off for a backfill, where every run is historic and a burst of
+            ## messages about last week would be nothing but noise.
+            if notify and existing is None and alerts is not None:
+                try:
+                    alerts.notify_pump_run(fields['volume_l'], fields['volume_sigma_l'],
+                                           duration_s, fields['rate_l_per_h'], quality)
+                except Exception as e:
+                    log.warning(f"Could not notify the pump cycle at {_rfc3339(t0)}: {e}")
         else:
             skipped += 1
 
