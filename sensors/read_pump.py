@@ -44,10 +44,12 @@ import os
 import sys
 import json
 import time
+import queue
 import signal
 import logging
 import datetime
 import itertools
+import threading
 
 import serial
 
@@ -57,6 +59,30 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 ## Repo root on sys.path for the `common` package; when run as a script only sensors/ is on it.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
+
+## The puit sensor, for the well-level reading forced at each pump edge (see WELL LEVEL AT THE
+## PUMP'S EDGES below). A sibling script rather than a package, so it is imported by name — the
+## same import the Telegram bot uses.
+##
+## Guarded, for the same reason the InfluxDB client below is: read_puit reaches the Telegram
+## alert module and from there python-telegram-bot, and none of that is this process's business.
+## Recording pump transitions is, and a listener that refused to start because a notification
+## library was missing would be exactly the wrong trade. Without it the edges simply go
+## unmeasured, which pump_volume.py already handles as a lower `quality`.
+try:
+    import read_puit
+except Exception as _e:                # noqa: BLE001 - anything here means "no level readings"
+    read_puit = None
+    logging.getLogger('read_pump').warning(
+        f"Could not import read_puit ({_e}); no well level will be recorded at pump edges.")
+
+## Turns finished runs into water volumes. Guarded for the same reason.
+try:
+    import pump_volume
+except Exception as _e:                # noqa: BLE001 - anything here means "no volumes"
+    pump_volume = None
+    logging.getLogger('read_pump').warning(
+        f"Could not import pump_volume ({_e}); pump runs will not be costed in litres.")
 
 from common import boards
 from common.logging_setup import setup_logging, attach_influx_handler
@@ -654,6 +680,131 @@ def _close_truncated(saved):
 # -------------------------------------------------------------------------------------------------
 # LISTEN
 
+# -------------------------------------------------------------------------------------------------
+# WELL LEVEL AT THE PUMP'S EDGES
+#
+# How much water a run actually moved is read from the well level on either side of it;
+# sensors/pump_volume.py does that arithmetic. What it needs from here is a level reading AT the
+# edges. The scheduled sensor samples every 5 minutes and a transition falls wherever it falls,
+# so the nearest scheduled sample can be five minutes stale — half of a ten-minute run. So each
+# transition forces one reading. It lands in `height_measure` like any other, timestamped when
+# the burst happened, and incidentally gives the level series extra resolution exactly where
+# something is happening to it.
+#
+# IT RUNS ON ITS OWN THREAD, NEVER ON THE LISTEN LOOP.
+# read_puit.measure_once takes the cross-process flock on the puit port, which the scheduled run
+# can hold for tens of seconds. Waiting for that inline would eat into the silence deadline
+# (SILENCE_FACTOR heartbeats) and delay SIGTERM by the same amount — the listener's one job is to
+# be reading when the board speaks.
+#
+# The queue is two deep on purpose. If the pump cycles faster than the well can be measured, the
+# freshest edge is worth more than a backlog of stale ones, so an overflow drops the oldest and
+# says so rather than blocking the listener or growing without bound.
+#
+# Alerts are suppressed on these readings — see the check_alerts note in read_puit.
+
+## Long enough to wait out a scheduled measurement holding the flock, short enough that a wedged
+## holder does not keep the worker parked past several pump cycles.
+BOUNDARY_LOCK_TIMEOUT_S = 30
+
+_boundary_q = queue.Queue(maxsize=2)
+
+
+def _boundary_worker():
+    """Take one well-level reading per queued pump edge, until the sentinel arrives."""
+    while True:
+        item = _boundary_q.get()
+        if item is None:
+            return
+        state, when = item
+        if _stopping:
+            continue
+        try:
+            height, resampled, db_ok = read_puit.measure_once(
+                lock_timeout=BOUNDARY_LOCK_TIMEOUT_S, check_alerts=False)
+            log.info(f"Well level at pump {state!r}: {height:.1f} cm "
+                     f"({time.time() - when:.0f} s after the edge"
+                     f"{', resampled' if resampled else ''})"
+                     f"{'' if db_ok else ' — NOT recorded'}")
+        except Exception as e:
+            # Never fatal, and deliberately not a `continue`: the run still ended, and it can
+            # still be costed from the scheduled samples around it — at a lower `quality`, which
+            # is exactly what that tag is for. Killing this thread would cost every future run.
+            log.warning(f"No well level for the pump going {state!r}: {e}")
+
+        # A run that has just ended now has whatever levels it is going to get, so cost it. Only
+        # when the pump has STOPPED: a start ends no pumping run, and sweeping there would only
+        # delay the next edge reading, which is the one thing on this thread worth protecting.
+        if state != 'on':
+            _sweep_volumes()
+
+
+## How far back a triggered sweep looks. Generous rather than minimal: its whole value over
+## computing just the run that ended is that it also picks up whatever an earlier restart or a
+## database outage left unanswered, and a batch replayed out of the board's history buffer can
+## span hours. The query is cheap and finds nothing on the runs already done.
+SWEEP_WINDOW_S = 24 * 3600
+
+
+def _sweep_volumes():
+    """Cost every run that has no volume yet. Never fatal, never the caller's problem.
+
+    settle_s=0 because the wait this normally guards against has already happened: we are here
+    because the closing level reading was just written. Anything else this picks up ended long
+    ago by definition.
+    """
+    if pump_volume is None:
+        return
+    try:
+        written, skipped = pump_volume.sweep(SWEEP_WINDOW_S, settle_s=0)
+    except Exception as e:
+        # The next pump stop sweeps again and finds this run still unanswered, so a failure
+        # here costs a delay, not a number. Losing the listener would cost the number.
+        log.warning(f"Could not compute pump volumes: {e}")
+        return
+    if written:
+        log.info(f"Costed {written} pump run(s) in litres.")
+
+
+def request_boundary_measure(state, when):
+    """Ask for a well-level reading at this pump edge. Never blocks the caller."""
+    if read_puit is None:
+        return
+    item = (state, when)
+    try:
+        _boundary_q.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+    try:
+        stale, _ = _boundary_q.get_nowait()
+        _boundary_q.put_nowait(item)
+        log.warning(f"The pump is cycling faster than the well can be measured; dropped the "
+                    f"queued reading for the {stale!r} edge to keep the {state!r} one.")
+    except (queue.Empty, queue.Full):
+        log.warning(f"Could not queue a well-level reading for the {state!r} edge.")
+
+
+def start_boundary_worker():
+    """Start the edge-measurement thread. Daemon: a hard kill must not wait on a burst."""
+    if read_puit is None:
+        return None
+    thread = threading.Thread(target=_boundary_worker, name='boundary', daemon=True)
+    thread.start()
+    return thread
+
+
+def stop_boundary_worker():
+    """Wake the worker so it can leave. Best effort — it is a daemon thread either way."""
+    try:
+        _boundary_q.put_nowait(None)
+    except queue.Full:
+        pass
+
+
+# -------------------------------------------------------------------------------------------------
+# LISTENING
+
 def listen(port, seq, hb_interval_s):
     """Read and record until the link goes quiet, the board restarts, or we are stopping.
 
@@ -715,6 +866,9 @@ def listen(port, seq, hb_interval_s):
             record_transition(state, now, 'event', obj,
                               prev_state=obj.get('prev_state'), duration_s=duration_s,
                               seq=this_seq, uptime_ms=obj.get('ms'), seq_missed=seq_missed)
+            # Both directions: the run that just ended needs its closing level and the one just
+            # starting needs its opening one, and they are the same reading.
+            request_boundary_measure(state, now)
             _warn_on_health(obj)
         elif obj.get('ev') == 'hb':
             log.debug(f"Heartbeat: {state} since {_format_since(obj.get('since_ms'))}")
@@ -939,5 +1093,9 @@ if __name__ == '__main__':
     attach_influx_handler(write_api, INFLUXDB_BUCKET, INFLUXDB_ORG)
 
     log.info("Pump listener starting.")
-    run()
+    start_boundary_worker()
+    try:
+        run()
+    finally:
+        stop_boundary_worker()
     log.info("Pump listener stopped.")

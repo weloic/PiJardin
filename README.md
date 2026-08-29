@@ -65,6 +65,17 @@ project; the Telegram bot is an add-on and never writes to it):
   `n`/`n_valid`/`n_timeout`/`n_rejected`/`n_no_response` say how the burst went. Graphing
   `n_valid / n` is the best early warning there is: a sensor on its way out trends down for
   weeks before it fails outright.
+
+  **Every reading is the median of 3 bursts taken half a second apart**, and 4 more are taken
+  when either the bursts disagree by more than 1 cm or the result has moved more than 5 cm
+  since the last stored reading — `resampled` marks that second round, whichever triggered it.
+  The spacing is the part that matters and is easy to get wrong: a burst's 10 pings are ~3 ms
+  apart, so the whole burst spans about a tenth of a second and all ten pings see the *same*
+  phase of whatever the surface is doing. More pings per burst therefore fight electrical noise
+  and do almost nothing about ripple; separating the bursts in time is what averages over a
+  moving surface. That matters because the cistern can run as a closed loop, whose returning
+  flow disturbs the surface without moving the level — so the 5 cm jump test never fires, and a
+  rippled surface would otherwise be read once and believed.
 - **`log` measurement** — every `WARNING`+ from the scheduled `sensors.service` data path
   (`read_puit`/`alerts`), written automatically. Tags: `level`, `source`; field: `message`.
 - **`version` measurement** — a marker written by `deploy.sh` on each deploy (`event=deploy`)
@@ -139,7 +150,7 @@ both PiJardin boards a reset needs the 1200-baud touch, not a DTR edge. That is 
 restart of this service cheap — the board keeps counting, and `since_ms` + the history buffer
 let the Pi recover the gap exactly.
 
-**Two measurements**, both tagged `pump`:
+**Three measurements**, all tagged `pump`:
 
 - **`pump_state`** — one point per transition *and* per heartbeat. Field `state` is an integer:
   `1` on, `0` off, `-1` sensor fault, `-2` unknown. Filter `state >= 0` for the pump trace,
@@ -164,6 +175,9 @@ let the Pi recover the gap exactly.
   Every transition also cross-checks the board's duration against the interval this service
   watched pass, and logs a WARNING if they disagree — reading `prev_ms` as a duration once
   produced runs 4.5× too long that looked entirely plausible next to a correct state trace.
+- **`pump_volume`** — one point per finished `on` run, timestamped at the same **start** as the
+  `pump_run` it describes, with `volume_l`: how much water actually left the cistern. See
+  "How much water a run used" below.
 
 **The cursor is durable.** `sensors/.pump_state.json` records the last event InfluxDB actually
 *accepted*, not the last line the serial port delivered, so a crash in between replays that
@@ -176,6 +190,91 @@ wrapped while the Pi was down longer than 32 transitions.
 Check it without SSH: `/pompe` on the Telegram bot (reads the state file, never the port —
 the daemon holds that open for its whole life), `/boards` for USB-level presence, and
 `/logs pump` for the journal.
+
+## How much water a run used
+
+`sensors/pump_volume.py` turns each finished pump run into a volume in litres and records it as
+`pump_volume`. The Grafana table **« Eau utilisée / perdue — 3 derniers cycles de pompage »** and
+the Telegram command **`/pertes`** are the two views of it.
+
+**There is no timer.** `read_pump.py` calls the sweep as soon as it has written the level reading
+forced at a pump stop, so a run is costed within seconds of ending. What makes that safe is that
+the sweep asks the database *"which runs have no volume yet?"* rather than *"cost the run that
+just ended"*. A calculation that never happened — `deploy.timer` restarted `pump.service` in the
+middle, the Pi lost power, InfluxDB was down — leaves the run simply unanswered, and the next
+pump cycle picks it up. The runs replayed out of the board's history buffer after any downtime
+arrive in a batch and are handled the same way, with no special case. The one gap is that nothing
+runs while the pump is idle; `/pertes` sweeps before it reads, which closes it on demand.
+
+**It is measured, never multiplied by a flow rate — that is the whole point.** The cistern feeds
+either irrigation, where the water leaves and does not come back, or a **closed loop**, where it
+circulates and returns minus whatever the loop leaks or sprays away. Those two produce the same
+pump run: same duration, same current, nothing the pump board can tell apart. `duration_s × a
+constant` would report the same volume for both and be confidently wrong half the time. The well
+level is what separates them — and in the closed-loop case the number it gives *is* the loop's
+losses, which is what this exists to catch.
+
+**How.**
+
+```
+volume = (level at the start − level at the end) × 40 L/cm   +   whatever rain put back
+```
+
+Each of those two levels is **the reading `read_pump.py` forces at the transition** — the single
+measurement taken at exactly the instant that matters. There is no curve fitting: the reading is
+used as it stands.
+
+Unless the routine readings either side of it say it cannot be right. The check is a **bracket**:
+between the routine reading before the transition and the one after it, the level has genuinely
+moved — by a lot on a fast run — so any value inside the range those two span, plus 2 cm, is
+plausible. Only something outside it is evidence of a bad reading, and that is what catches a
+stray echo or a surface the returning loop has stirred into ripples. A rejected reading is
+replaced by the neighbours, interpolated to the transition time, and the run is marked `coarse`.
+That fallback is noticeably worse — it draws a straight line across the very instant the level
+changed direction, and can be 100 L out on a 600 L run — which is why `volume_sigma_l` widens to
+the full neighbour spread when it happens.
+
+For a 15-minute run starting at 14:07:20, the start level is checked against the 14:05 and 14:10
+readings, and the end level against 14:20 and 14:25.
+
+The forced readings are what make short runs measurable at all: `sensors.timer` samples every 5
+minutes, so without them a boundary can be five minutes stale — half of a ten-minute run. They
+land in `height_measure` like any other reading, and get the same multi-burst treatment (see
+above), which is what keeps a loop-disturbed surface from deciding a volume. They are taken on a
+**separate thread** so waiting for the puit flock can never delay the pump listener, and with the
+volume alerts suppressed — a reading taken the instant the pump stops is the lowest of the whole
+cycle, and feeding those to the thresholds would fire "volume bas" every time.
+
+**The rain term is almost always zero.** The cistern gains water when it rains, and the pump is
+rarely running then, so this reads 0 and disappears. It is there for when the two coincide,
+because that is exactly where it flips the sign of the answer: a closed-loop cycle that loses 10 L
+while 45 L of rain falls in ends with *more* water than it started with, and would otherwise be
+reported as −35 L instead of +10 L. The rate is measured per run from the quiet stretch before it
+(first reading against last, nothing fitted), and only if that stretch is at least 10 minutes long.
+
+**Every point says how far to trust it.** `volume_sigma_l` is the uncertainty — the level moves
+40 litres per centimetre, so a small enough loss is indistinguishable from sensor noise, and this
+says so out loud instead of printing a confident number. Tag `quality` is `ok` (both forced
+readings used and vouched for by their neighbours), `coarse` (one was rejected, absent, or had no
+neighbours to check it against), or `degraded` (a `truncated` run, whose duration is itself only
+a lower bound).
+
+**It is a cache, not a record.** Every input stays in InfluxDB, so the estimator can be changed
+and the whole history rebuilt — which it will need to be, since several constants in there are
+first guesses:
+
+```
+python sensors/pump_volume.py                            # sweep the last 24 h
+python sensors/pump_volume.py --since 90d --recompute    # rebuild everything
+```
+
+(`--since` takes `24h`, `7d`, `90d`. Not `-90d` with a space — argparse reads a leading dash as
+an option; `--since=-90d` works if you are copying a Flux range literal.)
+
+**What it cannot do.** At 40 litres per centimetre, a small enough loss is lost in the sensor's
+own wobble — `volume_sigma_l` is what admits that. And if rain starts or stops *during* a run,
+the rate measured from the quiet stretch before it is the wrong one and nothing here can tell.
+An inline flow meter is the only thing that removes either.
 
 ⚠️ **Flashing this board is not `/flash`.** It is an RP2040: its bootloader exposes no SAM-BA
 interface, only the `RPI-RP2` mass-storage drive, so `bossac` cannot touch it. `flash_firmware.py`

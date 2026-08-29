@@ -1,4 +1,4 @@
-{
+﻿{
   "annotations": {
     "list": [
       {
@@ -180,7 +180,6 @@
               "mode": "off"
             }
           },
-          "displayName": "Volume",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -192,7 +191,79 @@
           },
           "unit": "m3"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Volume"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Pompe"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Pompe"
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 20
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 12,
@@ -207,7 +278,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": false
+          "showLegend": true
         },
         "tooltip": {
           "hideZeros": false,
@@ -220,6 +291,10 @@
         {
           "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
+        },
+        {
+          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_state\")\n  |> filter(fn: (r) => r._field == \"state\")\n  // >= 0 is the pump itself; the negatives are the board saying it could not tell.\n  |> filter(fn: (r) => r._value >= 0)\n  |> keep(columns: [\"_time\", \"_value\"])\n  // One line, not one per `source` tag: event, heartbeat and replay points are the same\n  // trace learned three different ways.\n  |> group()\n  |> sort(columns: [\"_time\"])",
+          "refId": "B"
         }
       ],
       "title": "Historique 24h",
@@ -252,67 +327,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 6,
+        "h": 3,
+        "w": 12,
         "x": 0,
-        "y": 8
-      },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "12.0.2",
-      "targets": [
-        {
-          "query": "data = from(bucket: \"puit\")\r\n  |> range(start: -3h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirstAvg = data |> limit(n: 3) |> mean() |> set(key: \"k\", value: \"first\")\r\nlastAvg = data |> tail(n: 3) |> mean() |> set(key: \"k\", value: \"last\")\r\n\r\nunion(tables: [firstAvg, lastAvg])\r\n  |> pivot(rowKey: [], columnKey: [\"k\"], valueColumn: \"_value\")\r\n  |> map(fn: (r) => ({ _time: now(), _value: r.last - r.first }))",
-          "refId": "A"
-        }
-      ],
-      "title": "Variation eau - 3 dernières heures",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "influxdb",
-        "uid": "influxdb-pijardin"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "continuous-RdYlGr"
-          },
-          "decimals": 0,
-          "mappings": [],
-          "max": 1000,
-          "min": -1000,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              }
-            ]
-          },
-          "unit": "litre"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 8
+        "y": 14
       },
       "id": 7,
       "options": {
@@ -332,7 +350,7 @@
       "pluginVersion": "12.0.2",
       "targets": [
         {
-          "query": "data = from(bucket: \"puit\")\r\n  |> range(start: -24h)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])\r\n\r\nfirstAvg = data |> limit(n: 6) |> mean() |> set(key: \"k\", value: \"first\")\r\nlastAvg = data |> tail(n: 6) |> mean() |> set(key: \"k\", value: \"last\")\r\n\r\nunion(tables: [firstAvg, lastAvg])\r\n  |> pivot(rowKey: [], columnKey: [\"k\"], valueColumn: \"_value\")\r\n  |> map(fn: (r) => ({ _time: now(), _value: r.last - r.first }))",
+          "query": "data = from(bucket: \"puit\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\n  |> filter(fn: (r) => r._field == \"lenght_median\")\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 40.0 }))\n  |> keep(columns: [\"_time\", \"_value\"])\n\n// A time window, not a number of points: the cadence is no longer uniform, so \"the first\n// 6 points\" is no longer \"the first half hour\" — and a burst of pump-edge readings at\n// either end would otherwise decide the whole answer.\nfirstAvg = data |> range(start: -24h, stop: -23h30m) |> mean() |> set(key: \"k\", value: \"first\")\nlastAvg  = data |> range(start: -30m)               |> mean() |> set(key: \"k\", value: \"last\")\n\nunion(tables: [firstAvg, lastAvg])\n  |> pivot(rowKey: [], columnKey: [\"k\"], valueColumn: \"_value\")\n  |> map(fn: (r) => ({ _time: now(), _value: r.last - r.first }))",
           "refId": "A"
         }
       ],
@@ -382,7 +400,6 @@
               "mode": "off"
             }
           },
-          "displayName": "Volume",
           "mappings": [],
           "max": 8,
           "min": 0,
@@ -396,13 +413,85 @@
           },
           "unit": "m3"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Volume"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Pompe"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Pompe"
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 20
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 12
+        "y": 17
       },
       "id": 4,
       "timeFrom": "3d",
@@ -411,7 +500,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": false
+          "showLegend": true
         },
         "tooltip": {
           "hideZeros": false,
@@ -424,6 +513,10 @@
         {
           "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
+        },
+        {
+          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_state\")\n  |> filter(fn: (r) => r._field == \"state\")\n  // >= 0 is the pump itself; the negatives are the board saying it could not tell.\n  |> filter(fn: (r) => r._value >= 0)\n  |> keep(columns: [\"_time\", \"_value\"])\n  // One line, not one per `source` tag: event, heartbeat and replay points are the same\n  // trace learned three different ways.\n  |> group()\n  |> sort(columns: [\"_time\"])",
+          "refId": "B"
         }
       ],
       "title": "Historique 3 jours",
@@ -472,7 +565,6 @@
               "mode": "off"
             }
           },
-          "displayName": "Volume",
           "mappings": [],
           "max": 8,
           "min": 0,
@@ -486,13 +578,85 @@
           },
           "unit": "m3"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Volume"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Pompe"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Pompe"
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 20
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 12
+        "y": 17
       },
       "id": 3,
       "timeFrom": "7d",
@@ -501,7 +665,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": false
+          "showLegend": true
         },
         "tooltip": {
           "hideZeros": false,
@@ -514,10 +678,235 @@
         {
           "query": "from(bucket: \"puit\")\r\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\r\n  |> filter(fn: (r) => r._measurement == \"height_measure\")\r\n  |> filter(fn: (r) => r._field == \"lenght_median\")\r\n  |> map(fn: (r) => ({ r with _value: (220.0 - r._value) * 0.04 }))\r\n  |> keep(columns: [\"_time\", \"_value\"])\r\n  |> sort(columns: [\"_time\"])",
           "refId": "A"
+        },
+        {
+          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_state\")\n  |> filter(fn: (r) => r._field == \"state\")\n  // >= 0 is the pump itself; the negatives are the board saying it could not tell.\n  |> filter(fn: (r) => r._value >= 0)\n  |> keep(columns: [\"_time\", \"_value\"])\n  // One line, not one per `source` tag: event, heartbeat and replay points are the same\n  // trace learned three different ways.\n  |> group()\n  |> sort(columns: [\"_time\"])",
+          "refId": "B"
         }
       ],
       "title": "Historique semaine",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-pijardin"
+      },
+      "description": "Combien d'eau a quitté la citerne pendant chacun des 3 derniers cycles de pompage. Mesuré à partir du niveau du puits de part et d'autre du cycle, et corrigé de la recharge naturelle — jamais estimé à partir d'un débit supposé. En circuit fermé, ce chiffre est la PERTE du circuit. La colonne ± dit si le chiffre est exploitable : quand elle dépasse la valeur, le cycle n'a pas bougé le niveau plus que le bruit du capteur.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "volume_l"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "litre"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 190
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-YlRd"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "volume_sigma_l"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "litre"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rate_l_per_h"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "litreh"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "quality"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "ok": {
+                        "text": "fiable",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "coarse": {
+                        "text": "approx.",
+                        "color": "yellow",
+                        "index": 1
+                      },
+                      "degraded": {
+                        "text": "douteux",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 9,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.0.2",
+      "timeFrom": "7d",
+      "targets": [
+        {
+          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_volume\")\n  |> filter(fn: (r) => r._field == \"volume_l\" or r._field == \"volume_sigma_l\"\n                    or r._field == \"rate_l_per_h\" or r._field == \"duration_s\")\n  |> keep(columns: [\"_time\", \"_field\", \"_value\", \"quality\"])\n  // group() before pivot: `quality` is a tag, so without it each quality would be its own\n  // table and tail(n: 3) would return three rows PER quality instead of three rows.\n  |> group()\n  |> pivot(rowKey: [\"_time\", \"quality\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"])\n  |> tail(n: 3)",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "includeByName": {},
+            "indexByName": {
+              "_time": 0,
+              "duration_s": 1,
+              "volume_l": 2,
+              "volume_sigma_l": 3,
+              "rate_l_per_h": 4,
+              "quality": 5
+            },
+            "renameByName": {
+              "_time": "Départ",
+              "duration_s": "Durée",
+              "volume_l": "Eau utilisée / perdue",
+              "volume_sigma_l": "±",
+              "rate_l_per_h": "Par heure",
+              "quality": "Fiabilité"
+            }
+          }
+        }
+      ],
+      "title": "Eau utilisée / perdue — 3 derniers cycles de pompage",
+      "type": "table"
     }
   ],
   "preload": true,
@@ -535,5 +924,5 @@
   "timezone": "browser",
   "title": "PiJardin",
   "uid": "1c60ae51-1537-405d-bb72-3aff8fd76b72",
-  "version": 13
+  "version": 14
 }

@@ -78,6 +78,31 @@ ACK_MARGIN_WARN = 0.5
 ## run fires every 5 minutes — throttle the admin notification per error code.
 FAULT_ALERT_INTERVAL_S = 6 * 3600
 
+## Bursts behind every recorded reading, and the gap between them.
+##
+## THREE, because one burst cannot tell a settled surface from a moving one — it returns a
+## number either way, and there is nothing in the reply to say which it was.
+##
+## SPACED, because that is the part that actually matters. A burst's pings are PING_GAP_S apart
+## plus their flight time, so the whole burst spans roughly a tenth of a second and its ten
+## pings all see the SAME phase of whatever the surface is doing. Averaging inside a burst
+## therefore fights electrical noise and quantisation, and does almost nothing about ripple —
+## which is why the board's own median of ten is not the end of the story. Half a second apart
+## puts each burst on a different part of the wave, and the median across them is then a median
+## over the disturbance rather than three views of one instant of it.
+BURSTS = 3
+BURST_GAP_S = 0.5
+
+## When the bursts disagree by more than this (cm, max - min), the surface is moving rather
+## than the level: take EXTRA_BURSTS more, over a longer stretch of time, and re-median.
+## This is what the pump's edge readings need. The cistern can run as a closed loop, whose
+## returning flow disturbs the surface exactly where the sensor is aimed, and it does so
+## without moving the level — so the >5 cm jump test below never fires, and without this a
+## rippled surface would be read once and trusted. Those readings are what every pumped-volume
+## figure rests on (sensors/pump_volume.py).
+BURST_SPREAD_CM = 1.0
+EXTRA_BURSTS = 4
+
 ## Well geometry: the sensor measures the distance (cm) down to the water surface.
 ## Same conversion as the Grafana dashboards: volume_m3 = (220 - distance_cm) * 0.04
 PUIT_EMPTY_DISTANCE_CM = 220.0
@@ -723,12 +748,54 @@ def write_influx_measurement(heigth_median, resampled=False, resp=None):
         return False
 
 
-def collect_puit_data(arduino):
-    """One measurement cycle: burst, resample if the level jumped, record, check thresholds.
+def _spread_cm(responses):
+    """How far apart the burst values are, cm. The surface-movement signal."""
+    values = [r['value'] for r in responses]
+    return max(values) - min(values) if len(values) > 1 else 0.0
+
+
+def _extra_bursts(arduino, count):
+    """Fire `count` more bursts, BURST_GAP_S apart. Returns those that succeeded.
+
+    Tolerant by design: every caller already holds at least one successful burst, so a failure
+    here costs precision rather than the reading. The gap is the point of the exercise — see
+    BURSTS — so it comes before each burst, including the first of this batch, which is
+    separated from whatever the caller took last.
+    """
+    responses = []
+    for index in range(count):
+        time.sleep(BURST_GAP_S)
+        try:
+            extra = measure(arduino)
+        except PuitError as e:
+            log.warning(f"Extra burst {index + 1}/{count} failed: {e}")
+            continue
+        log_burst_health(extra)
+        responses.append(extra)
+    return responses
+
+
+def collect_puit_data(arduino, check_alerts=True):
+    """One measurement cycle: bursts, extra bursts if warranted, record, check thresholds.
 
     Returns (height_cm, resampled, db_ok). Raises PuitError when the sensor produced no
     usable reading — the code says whose problem it is, and it is already logged at the
     level it deserves and alerted on if someone has to go to the well.
+
+    Every reading is the median of BURSTS spaced bursts, and EXTRA_BURSTS more are taken when
+    either the bursts disagree with each other (a moving surface) or the result disagrees with
+    the last stored reading (a level that cannot have moved that far). `resampled` is true when
+    that second round happened, for either reason — it used to mean the jump test alone, and
+    now means "this reading needed more than the standard set", which is the thing worth
+    knowing about a stored point.
+
+    `check_alerts=False` records the reading but skips the volume thresholds. That is for the
+    readings read_pump.py forces at a pump transition: one taken the moment the pump stops is
+    taken at the BOTTOM of the drawdown — the lowest the water gets all cycle, not the resting
+    level the thresholds are written against. A cistern sitting anywhere near
+    ALERT_LOW_VOLUME_M3 would otherwise send "volume bas" on every pump cycle and "volume
+    remonté" once it recovered, for ever. Nothing is lost by skipping it: the scheduled run
+    minutes later still sees a genuinely empty cistern.
     """
     max_diff_tolerance = 5 # cm
     resampled = False
@@ -752,22 +819,33 @@ def collect_puit_data(arduino):
         raise
 
     log_burst_health(resp)
-    height = resp['value']
     responses = [resp]
 
-    if previous_measure is not None:
-        if abs(height-previous_measure) > max_diff_tolerance:
-            for _ in range(4):
-                try:
-                    extra = measure(arduino)
-                except PuitError as e:
-                    # Keep the bursts we do have; the first one already succeeded.
-                    log.warning(f"Resample failed: {e}")
-                    continue
-                log_burst_health(extra)
-                responses.append(extra)
-            height = float(median([r['value'] for r in responses]))
-            resampled = True
+    # The rest of the standard set. Tolerant, unlike the first: that one has already told us
+    # the sensor is answering, so a later failure costs precision rather than the reading.
+    responses += _extra_bursts(arduino, BURSTS - 1)
+    height = float(median([r['value'] for r in responses]))
+
+    spread = _spread_cm(responses)
+    jumped = previous_measure is not None and abs(height - previous_measure) > max_diff_tolerance
+    rippled = spread > BURST_SPREAD_CM
+
+    if rippled or jumped:
+        # Both reasons mean the same thing — look harder before believing this — so they take
+        # the same action. They are logged apart because they say different things about the
+        # well: `rippled` is a surface being disturbed, `jumped` is a level that appears to
+        # have moved further than it can have.
+        if rippled:
+            log.info(f"Bursts disagree by {spread:.1f} cm (> {BURST_SPREAD_CM} cm): the surface "
+                     f"is moving, taking {EXTRA_BURSTS} more.")
+        if jumped:
+            log.info(f"Level moved {abs(height - previous_measure):.1f} cm since the last "
+                     f"reading (> {max_diff_tolerance} cm), taking {EXTRA_BURSTS} more.")
+        responses += _extra_bursts(arduino, EXTRA_BURSTS)
+        height = float(median([r['value'] for r in responses]))
+        resampled = True
+        log.info(f"Kept {height:.1f} cm as the median of {len(responses)} bursts "
+                 f"(spread {_spread_cm(responses):.1f} cm).")
 
     # Record the raw pulse and counts of the burst that produced the retained value, so
     # pulse_us and lenght_median stay the same measurement — that is what makes a later
@@ -776,10 +854,11 @@ def collect_puit_data(arduino):
     db_ok = write_influx_measurement(height, resampled, kept)
     save_previous_measure(height)
 
-    try:
-        alerts.check_thresholds(height_to_volume(height))
-    except Exception as e:
-        log.error(f"Alert check failed: {e}")
+    if check_alerts:
+        try:
+            alerts.check_thresholds(height_to_volume(height))
+        except Exception as e:
+            log.error(f"Alert check failed: {e}")
 
     return height, resampled, db_ok
 
@@ -825,14 +904,14 @@ def _with_arduino(lock_timeout, action):
             arduino.close()
 
 
-def measure_once(lock_timeout=0):
+def measure_once(lock_timeout=0, check_alerts=True):
     """Run one full measurement cycle: lock, open serial, measure (+DB write), clean up.
 
     Returns (height, resampled, db_ok). Raises PuitError if the sensor gave no valid
     reading, or TimeoutError if another measurement holds the lock past lock_timeout
-    seconds.
+    seconds. `check_alerts` is passed straight through to collect_puit_data.
     """
-    return _with_arduino(lock_timeout, collect_puit_data)
+    return _with_arduino(lock_timeout, lambda arduino: collect_puit_data(arduino, check_alerts))
 
 
 def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):

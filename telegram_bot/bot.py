@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(_REPO, 'sensors'))
 
 import read_puit
 import read_pump
+import pump_volume
 from common import boards
 from common.logging_setup import setup_logging
 
@@ -346,6 +347,83 @@ async def pompe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  f"connu, pas une mesure actuelle. Voir /logs pump.")
     await update.message.reply_text(text)
 
+## How far back /pertes computes. Wider than the sweep read_pump triggers on each pump stop,
+## because this one is the catch-up path: it is what answers for the runs that happened while
+## the volume code was not deployed yet, or during a stretch when nothing swept. A week of
+## height_measure is a couple of thousand points — cheap, and it only ever writes what is
+## genuinely missing.
+PERTES_SWEEP_S = 7 * 24 * 3600
+
+## How the reliability of a costed run reads to someone who did not write the estimator.
+PERTES_QUALITY_FR = {
+    'ok':       '',
+    'coarse':   ' ≈',
+    'degraded': ' ⚠️',
+}
+
+async def pertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """How much water each of the last pump cycles used or lost.
+
+    Sweeps first, then reads. The sweep is what makes this answer on a Pi where the pump has
+    not run since the last deploy: costing a run is idempotent, so calling it here computes
+    whatever is outstanding and does nothing at all once everything is up to date. It is also
+    the manual way to close the one gap in triggering off pump stops — nothing runs while the
+    pump is idle.
+    """
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    # Any registered role (admin or viewer); banned entries have no role.
+    if user is None or user.get("banned") or not user.get("role"):
+        await update.message.reply_text("You need to register first: /start <password>")
+        return
+
+    try:
+        await asyncio.to_thread(pump_volume.sweep, PERTES_SWEEP_S)
+    except Exception as e:
+        # Not fatal to the command: whatever was already costed is still worth showing.
+        log.warning(f"/pertes could not sweep: {e}")
+
+    try:
+        rows = await asyncio.to_thread(pump_volume.query_recent, 5)
+    except Exception as e:
+        log.error(f"/pertes could not read volumes: {e}")
+        await update.message.reply_text("Impossible de lire les volumes (voir /logs bot).")
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            "Aucun cycle de pompage chiffré pour l'instant.\n"
+            "Le volume est mesuré à partir du niveau du puits de part et d'autre d'un cycle, "
+            "il faut donc qu'une pompe ait tourné depuis l'installation. Voir /pompe et "
+            "/logs pump.")
+        return
+
+    lines = ["💧 <b>Eau utilisée / perdue</b> — derniers cycles\n"]
+    for row in reversed(rows):                      # newest first for a phone screen
+        when = row['time'].astimezone().strftime('%d/%m %H:%M')
+        volume, sigma = row.get('volume_l'), row.get('volume_sigma_l')
+        rate, duration = row.get('rate_l_per_h'), row.get('duration_s')
+
+        if volume is None:
+            continue
+        detail = f"{volume:.0f} L"
+        if sigma is not None:
+            detail += f" ± {sigma:.0f}"
+            if sigma >= abs(volume):
+                # Saying "5 L" when the method cannot resolve 5 L is the one way this display
+                # could actively mislead.
+                detail += " (dans le bruit)"
+        if rate is not None:
+            detail += f", {rate:.0f} L/h"
+
+        lines.append(f"• {when} — {_format_duration_fr(duration)} : {detail}"
+                     f"{PERTES_QUALITY_FR.get(row.get('quality'), '')}")
+
+    lines.append("\n<i>≈ mesure approximative, ⚠️ peu fiable. En circuit fermé, ce chiffre "
+                 "est la perte du circuit.</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_start, title, autoscale_y=False):
     """Query the volume history for `range_start` and reply with a rendered chart."""
     chat_id = str(update.effective_chat.id)
@@ -652,6 +730,8 @@ HELP_GENERAL = (
     "<b>/mesure</b> — mesure le niveau du puits maintenant (alias <b>/measure</b>)\n"
     "<b>/pompe</b> — la pompe tourne-t-elle, et depuis combien de temps ; signale si la "
     "carte ne donne plus signe de vie (alias <b>/pump</b>)\n"
+    "<b>/pertes</b> — eau utilisée ou perdue lors des derniers cycles de pompage, "
+    "mesurée sur le niveau du puits (en circuit fermé : les pertes du circuit)\n"
     "<b>/alertes</b> [on|off] — active/désactive les alertes de volume bas ; "
     "sans argument, affiche l'état actuel et les seuils\n"
     "<b>/graphe24h</b> · <b>/graphe3j</b> · <b>/graphe7j</b> — graphique du volume "
@@ -777,6 +857,7 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("alertes", alerts))
 application.add_handler(CommandHandler(["mesure", "measure"], measure))
 application.add_handler(CommandHandler(["pompe", "pump"], pompe))
+application.add_handler(CommandHandler("pertes", pertes))
 application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
