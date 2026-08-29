@@ -175,7 +175,7 @@ let the Pi recover the gap exactly.
   Every transition also cross-checks the board's duration against the interval this service
   watched pass, and logs a WARNING if they disagree — reading `prev_ms` as a duration once
   produced runs 4.5× too long that looked entirely plausible next to a correct state trace.
-- **`pump_volume`** — one point per finished `on` run, timestamped at the same **start** as the
+- **`pump_cycle`** — one point per finished `on` run, timestamped at the same **start** as the
   `pump_run` it describes, with `volume_l`: how much water actually left the cistern. See
   "How much water a run used" below.
 
@@ -194,7 +194,7 @@ the daemon holds that open for its whole life), `/boards` for USB-level presence
 ## How much water a run used
 
 `sensors/pump_volume.py` turns each finished pump run into a volume in litres and records it as
-`pump_volume`. The Grafana table **« Eau utilisée / perdue — 3 derniers cycles de pompage »** and
+`pump_cycle`. The Grafana table **« Eau utilisée / perdue — 3 derniers cycles de pompage »** and
 the Telegram command **`/pertes`** are the two views of it, and **`/pertes on`** adds a message
 after every cycle saying what it cost. That message is sent once, when the run is first costed —
 the recheck below deliberately stays quiet rather than sending a second message about one cycle —
@@ -285,14 +285,16 @@ first guesses:
 ```
 python sensors/pump_volume.py                            # sweep the last 24 h
 python sensors/pump_volume.py --since 90d --recompute    # rewrite every run
-python sensors/pump_volume.py --since 90d --purge        # erase them first, then rebuild
 ```
 
-`--recompute` overwrites; `--purge` deletes and starts again. The difference matters exactly once
-per schema change: tags are part of a point's identity, so when `quality` moved from a tag to a
-field, every run already recorded kept its old tagged series and the new write landed *beside* it
-rather than on top. The same cycle then appears twice, and no amount of rewriting fixes it —
-`deploy/migrations/0006_purge_pump_volume.sh` does that cleanup once on the Pi.
+**Changing a tag means changing the measurement name.** Tags are part of a point's identity in
+InfluxDB, so when `quality` moved from a tag to a field, every run already recorded kept its old
+tagged series and the new write landed *beside* it rather than on top — the same cycle listed
+twice, for ever, and no amount of `--recompute` fixes it. Deleting the strays needs a token with
+delete permission, which this deployment's has not got. So the measurement was renamed
+`pump_volume` → **`pump_cycle`** and the orphans left to expire with the bucket's retention. That
+costs nothing precisely because this is a cache: `pump_run` and `height_measure` are untouched and
+the sweep rebuilds everything. If a tag or a field type ever has to change again, rename it again.
 
 (`--since` takes `24h`, `7d`, `90d`. Not `-90d` with a space — argparse reads a leading dash as
 an option; `--since=-90d` works if you are copying a Flux range literal.)

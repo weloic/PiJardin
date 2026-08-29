@@ -109,6 +109,19 @@ except Exception as e:
 ## Which pump these runs belong to. Matches read_pump.PUMP.
 PUMP = 'puit'
 
+## Where the costed runs are written. One point per pump cycle, so it sits beside `pump_state`
+## and `pump_run` and reads the same way.
+##
+## It used to be `pump_volume`, and that name is now abandoned rather than reused. `quality`
+## started life as a TAG there, and tags are part of a point's identity in InfluxDB: the day it
+## became a field, every run already recorded kept its old tagged series and new writes landed
+## BESIDE the old ones rather than on top — the same cycle listed twice, for ever. Deleting the
+## strays needs a token with delete permission, which this deployment's has not got. A new name
+## costs nothing, is clean from the first write, and leaves the handful of orphans to expire with
+## the bucket's retention. Because this measurement is a cache and every input for it is still
+## in InfluxDB, starting a fresh one loses precisely nothing.
+MEASUREMENT = 'pump_cycle'
+
 ## Litres per centimetre of level. Derived, never spelled out: read_puit owns the well geometry.
 L_PER_CM = read_puit.PUIT_M3_PER_CM * 1000.0
 
@@ -454,14 +467,14 @@ def query_levels(since, until):
 
 
 def query_computed(since, until):
-    """Runs that already carry a pump_volume point: {start timestamp: quality}.
+    """Runs that already carry a costed point: {start timestamp: quality}.
 
     The quality is what decides whether a run is left alone or redone — see sweep().
     """
     flux = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {_rfc3339(since)}, stop: {_rfc3339(until)})\n'
-        '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
+        f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")\n'
         '  |> filter(fn: (r) => r._field == "quality")\n'
         '  |> keep(columns: ["_time", "_value"])'
     )
@@ -493,7 +506,7 @@ def query_recent(limit=5, since='-30d'):
     numeric = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {since})\n'
-        '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
+        f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")\n'
         f'  |> filter(fn: (r) => {predicate})\n'
         '  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")\n'
         '  |> sort(columns: ["_time"])\n'
@@ -502,7 +515,7 @@ def query_recent(limit=5, since='-30d'):
     text = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {since})\n'
-        '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
+        f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")\n'
         '  |> filter(fn: (r) => r._field == "quality")\n'
         '  |> keep(columns: ["_time", "_value"])\n'
         '  |> sort(columns: ["_time"])'
@@ -527,29 +540,8 @@ def query_recent(limit=5, since='-30d'):
     return sorted(rows.values(), key=lambda r: r['time'])[-int(limit):]
 
 
-def delete_computed(since, until):
-    """Erase every pump_volume point in the window. Returns True if the deletion went through.
-
-    Safe because this measurement is a cache: every input for it — pump_run, height_measure — is
-    still in InfluxDB, so a sweep rebuilds whatever this removes.
-
-    It exists for a specific hazard. Tags are part of a point's identity, so the day `quality`
-    moved from a tag to a field, every run already recorded kept its old tagged series and the
-    new write landed beside it instead of on top of it — the same run, listed twice, for ever.
-    Rewriting cannot fix that; only removing the old series can.
-    """
-    try:
-        client.delete_api().delete(
-            _rfc3339(since), _rfc3339(until), '_measurement="pump_volume"',
-            bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG)
-        return True
-    except Exception as e:
-        log.error(f"Could not delete the old pump_volume points: {e}")
-        return False
-
-
 def write_volume_point(start, fields, quality):
-    """Record one pump_volume, timestamped at the run's START like pump_run itself.
+    """Record one costed cycle, timestamped at the run's START like pump_run itself.
 
     Same timestamp and same convention as the run it describes, so the two line up without a
     join and a re-run overwrites its own previous answer instead of accumulating versions.
@@ -558,7 +550,7 @@ def write_volume_point(start, fields, quality):
         log.warning("No InfluxDB write API; pump volume not recorded.")
         return False
 
-    point = Point('pump_volume').tag('pump', PUMP).field('quality', quality)
+    point = Point(MEASUREMENT).tag('pump', PUMP).field('quality', quality)
     for name, cast in VOLUME_FIELDS:
         if name == 'quality':
             continue                       # written above; it is the only non-numeric field
@@ -712,10 +704,6 @@ if __name__ == '__main__':
                         help="how far back to sweep, e.g. 24h, 7d, 90d (default: 24h)")
     parser.add_argument('--recompute', action='store_true',
                         help="rewrite runs that already have a volume, instead of skipping them")
-    parser.add_argument('--purge', action='store_true',
-                        help="erase every pump_volume point in the window first, then rebuild "
-                             "the lot. For when rewriting is not enough because the points "
-                             "carry an older tag set (see delete_computed)")
     args = parser.parse_args()
 
     # WARNING+ from this data path goes to InfluxDB, exactly as the two sensors do. Attached
@@ -723,13 +711,7 @@ if __name__ == '__main__':
     attach_influx_handler(write_api, INFLUXDB_BUCKET, INFLUXDB_ORG)
 
     try:
-        if args.purge:
-            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-            if not delete_computed(now - args.since, now):
-                sys.exit(1)
-            log.info(f"Erased the pump_volume points of the last {args.since / 3600:.0f} h; "
-                     f"rebuilding them from pump_run and height_measure.")
-        written, skipped = sweep(args.since, recompute=args.recompute or args.purge)
+        written, skipped = sweep(args.since, recompute=args.recompute)
     except Exception as e:
         log.error(f"Pump volume sweep failed: {e}", exc_info=True)
         sys.exit(1)
