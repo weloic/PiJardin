@@ -284,8 +284,15 @@ first guesses:
 
 ```
 python sensors/pump_volume.py                            # sweep the last 24 h
-python sensors/pump_volume.py --since 90d --recompute    # rebuild everything
+python sensors/pump_volume.py --since 90d --recompute    # rewrite every run
+python sensors/pump_volume.py --since 90d --purge        # erase them first, then rebuild
 ```
+
+`--recompute` overwrites; `--purge` deletes and starts again. The difference matters exactly once
+per schema change: tags are part of a point's identity, so when `quality` moved from a tag to a
+field, every run already recorded kept its old tagged series and the new write landed *beside* it
+rather than on top. The same cycle then appears twice, and no amount of rewriting fixes it —
+`deploy/migrations/0006_purge_pump_volume.sh` does that cleanup once on the Pi.
 
 (`--since` takes `24h`, `7d`, `90d`. Not `-90d` with a space — argparse reads a leading dash as
 an option; `--since=-90d` works if you are copying a Flux range literal.)

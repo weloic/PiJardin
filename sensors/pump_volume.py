@@ -513,15 +513,39 @@ def query_recent(limit=5, since='-30d'):
         for record in table.records:
             qualities[record.get_time()] = record.get_value()
 
-    rows = []
+    ## Keyed by timestamp, so one run can only ever produce one row. Belt and braces: a run IS
+    ## one point, but the day `quality` moved from a tag to a field the old series stayed behind
+    ## and every affected run listed twice. delete_computed clears that up; this makes sure no
+    ## future split can put a duplicate in front of anyone again.
+    rows = {}
     for table in query_api.query(numeric, org=INFLUXDB_ORG):
         for record in table.records:
             row = {'time': record.get_time(), 'quality': qualities.get(record.get_time())}
             for name in RECENT_NUMERIC:
                 row[name] = record.values.get(name)
-            rows.append(row)
-    rows.sort(key=lambda r: r['time'])
-    return rows[-int(limit):]
+            rows[record.get_time()] = row
+    return sorted(rows.values(), key=lambda r: r['time'])[-int(limit):]
+
+
+def delete_computed(since, until):
+    """Erase every pump_volume point in the window. Returns True if the deletion went through.
+
+    Safe because this measurement is a cache: every input for it — pump_run, height_measure — is
+    still in InfluxDB, so a sweep rebuilds whatever this removes.
+
+    It exists for a specific hazard. Tags are part of a point's identity, so the day `quality`
+    moved from a tag to a field, every run already recorded kept its old tagged series and the
+    new write landed beside it instead of on top of it — the same run, listed twice, for ever.
+    Rewriting cannot fix that; only removing the old series can.
+    """
+    try:
+        client.delete_api().delete(
+            _rfc3339(since), _rfc3339(until), '_measurement="pump_volume"',
+            bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG)
+        return True
+    except Exception as e:
+        log.error(f"Could not delete the old pump_volume points: {e}")
+        return False
 
 
 def write_volume_point(start, fields, quality):
@@ -688,6 +712,10 @@ if __name__ == '__main__':
                         help="how far back to sweep, e.g. 24h, 7d, 90d (default: 24h)")
     parser.add_argument('--recompute', action='store_true',
                         help="rewrite runs that already have a volume, instead of skipping them")
+    parser.add_argument('--purge', action='store_true',
+                        help="erase every pump_volume point in the window first, then rebuild "
+                             "the lot. For when rewriting is not enough because the points "
+                             "carry an older tag set (see delete_computed)")
     args = parser.parse_args()
 
     # WARNING+ from this data path goes to InfluxDB, exactly as the two sensors do. Attached
@@ -695,7 +723,13 @@ if __name__ == '__main__':
     attach_influx_handler(write_api, INFLUXDB_BUCKET, INFLUXDB_ORG)
 
     try:
-        written, skipped = sweep(args.since, recompute=args.recompute)
+        if args.purge:
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            if not delete_computed(now - args.since, now):
+                sys.exit(1)
+            log.info(f"Erased the pump_volume points of the last {args.since / 3600:.0f} h; "
+                     f"rebuilding them from pump_run and height_measure.")
+        written, skipped = sweep(args.since, recompute=args.recompute or args.purge)
     except Exception as e:
         log.error(f"Pump volume sweep failed: {e}", exc_info=True)
         sys.exit(1)

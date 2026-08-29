@@ -423,6 +423,10 @@ async def pertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if volume is None:
             continue
+        # Round a hair below zero to zero rather than printing "-0 L", which reads as a bug.
+        # A tiny negative is normal: the level moved less than the sensor can resolve.
+        if abs(volume) < 0.5:
+            volume = 0.0
         detail = f"{volume:.0f} L"
         if sigma is not None:
             detail += f" ± {sigma:.0f}"
