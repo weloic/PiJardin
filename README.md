@@ -237,6 +237,17 @@ the full neighbour spread when it happens.
 For a 15-minute run starting at 14:07:20, the start level is checked against the 14:05 and 14:10
 readings, and the end level against 14:20 and 14:25.
 
+**Which is why a run is costed twice.** The sweep fires about two seconds after the pump stops —
+at 14:22:22, when the 14:25 reading does not exist yet, so nothing can vouch for the closing
+level. The run is written straight away as `coarse` with its stop reading taken on trust, and any
+run that is not yet `ok` and is younger than `RECHECK_HORIZON_S` is redone on the next sweep,
+by which time 14:25 has arrived. That second pass upgrades it to `ok` — or throws out a stop
+reading that turned out to be a stray echo, which the first pass had no way to catch.
+
+This is also why `quality` is a **field and not a tag**: tags are part of a point's identity, so
+rewriting the run as `ok` would leave a second series next to the `coarse` one instead of
+replacing it, and the run would appear twice in the table.
+
 The forced readings are what make short runs measurable at all: `sensors.timer` samples every 5
 minutes, so without them a boundary can be five minutes stale — half of a ten-minute run. They
 land in `height_measure` like any other reading, and get the same multi-burst treatment (see

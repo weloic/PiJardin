@@ -142,11 +142,25 @@ FALLBACK_SIGMA_CM = 1.0
 ## Fields written, and the type each must keep for ever (InfluxDB rejects a field that changes
 ## type). volume_l is the headline; the rest is what makes a surprising row checkable without
 ## re-running anything.
+##
+## `quality` is a FIELD and not a tag, which looks wrong until you consider the recompute below.
+## A run is first costed seconds after it ends, before the routine reading that would vouch for
+## its closing level exists, so it starts out `coarse` and is redone once that reading arrives.
+## Tags are part of a point's identity: rewriting it with quality='ok' would create a SECOND
+## series rather than replacing the first, and the run would appear twice. As a field it is
+## simply overwritten.
 VOLUME_FIELDS = (
     ('volume_l', float), ('rate_l_per_h', float), ('volume_sigma_l', float),
     ('volume_drop_l', float), ('refill_l_per_s', float), ('duration_s', float),
     ('level_start_cm', float), ('level_end_cm', float), ('n_quiet', int),
+    ('quality', str),
 )
+
+## How long after a run ends its inputs are still arriving. A run costed immediately cannot have
+## its closing level checked — the routine reading after the transition has not happened yet — so
+## anything not yet `ok` is redone while it is younger than this. Past it, every reading that will
+## ever exist does, and whatever quality it has is final.
+RECHECK_HORIZON_S = 30 * 60
 
 
 # -------------------------------------------------------------------------------------------------
@@ -363,6 +377,7 @@ def estimate_run(t0, t1, truncated, levels, quiet_start, sigma_floor):
         'level_start_cm': start_cm,
         'level_end_cm':   end_cm,
         'n_quiet':        n_quiet,
+        'quality':        quality,
     }, quality
 
 
@@ -412,18 +427,21 @@ def query_levels(since, until):
 
 
 def query_computed(since, until):
-    """Start times that already carry a pump_volume point, so a sweep skips them."""
+    """Runs that already carry a pump_volume point: {start timestamp: quality}.
+
+    The quality is what decides whether a run is left alone or redone — see sweep().
+    """
     flux = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {_rfc3339(since)}, stop: {_rfc3339(until)})\n'
         '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
-        '  |> filter(fn: (r) => r._field == "volume_l")\n'
-        '  |> keep(columns: ["_time"])'
+        '  |> filter(fn: (r) => r._field == "quality")\n'
+        '  |> keep(columns: ["_time", "_value"])'
     )
-    done = set()
+    done = {}
     for table in query_api.query(flux, org=INFLUXDB_ORG):
         for record in table.records:
-            done.add(round(record.get_time().timestamp()))
+            done[round(record.get_time().timestamp())] = record.get_value()
     return done
 
 
@@ -431,28 +449,28 @@ def query_recent(limit=5, since='-30d'):
     """The last `limit` costed runs, newest last. Returns [{'time', 'quality', <fields>}].
 
     For /pertes on the Telegram bot and for anything else that wants the numbers without
-    recomputing them. group() before pivot because `quality` is a tag: without it each quality
-    would be its own table and tail() would return `limit` rows PER quality.
+    recomputing them. group() before pivot so the fields land on one table and tail() counts
+    runs rather than series.
     """
     if query_api is None:
         return []
-    wanted = ('volume_l', 'rate_l_per_h', 'volume_sigma_l', 'duration_s')
+    wanted = ('volume_l', 'rate_l_per_h', 'volume_sigma_l', 'duration_s', 'quality')
     predicate = ' or '.join(f'r._field == "{name}"' for name in wanted)
     flux = (
         f'from(bucket: "{INFLUXDB_BUCKET}")\n'
         f'  |> range(start: {since})\n'
         '  |> filter(fn: (r) => r._measurement == "pump_volume")\n'
         f'  |> filter(fn: (r) => {predicate})\n'
-        '  |> keep(columns: ["_time", "_field", "_value", "quality"])\n'
+        '  |> keep(columns: ["_time", "_field", "_value"])\n'
         '  |> group()\n'
-        '  |> pivot(rowKey: ["_time", "quality"], columnKey: ["_field"], valueColumn: "_value")\n'
+        '  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")\n'
         '  |> sort(columns: ["_time"])\n'
         f'  |> tail(n: {int(limit)})'
     )
     rows = []
     for table in query_api.query(flux, org=INFLUXDB_ORG):
         for record in table.records:
-            row = {'time': record.get_time(), 'quality': record.values.get('quality')}
+            row = {'time': record.get_time()}
             for name in wanted:
                 row[name] = record.values.get(name)
             rows.append(row)
@@ -470,8 +488,10 @@ def write_volume_point(start, fields, quality):
         log.warning("No InfluxDB write API; pump volume not recorded.")
         return False
 
-    point = Point('pump_volume').tag('pump', PUMP).tag('quality', quality)
+    point = Point('pump_volume').tag('pump', PUMP).field('quality', quality)
     for name, cast in VOLUME_FIELDS:
+        if name == 'quality':
+            continue                       # written above; it is the only non-numeric field
         value = fields.get(name)
         if isinstance(value, (int, float)) and not isinstance(value, bool) \
                 and not math.isnan(value) and not math.isinf(value):
@@ -521,7 +541,7 @@ def sweep(since_s, recompute=False, now=None, settle_s=SETTLE_S):
     ## Level history has to reach back past the earliest run by the whole quiet window. Fetched
     ## once for the whole sweep rather than per run.
     levels = query_levels(runs[0][0] - QUIET_WINDOW_S, now)
-    done = set() if recompute else query_computed(since, now)
+    done = {} if recompute else query_computed(since, now)
 
     ## The sensor's own noise, measured from the series rather than assumed. Successive
     ## differences over the quiet stretches: the runs are where the level is deliberately moving,
@@ -541,9 +561,16 @@ def sweep(since_s, recompute=False, now=None, settle_s=SETTLE_S):
             log.debug(f"Run at {_rfc3339(t0)} ended too recently; leaving it for the next sweep.")
             skipped += 1
             continue
-        if round(t0) in done:
-            skipped += 1
-            continue
+        ## Already costed? Leave it alone once it is `ok`, or once every reading that could
+        ## improve it has had time to arrive. In between — the usual case for a run costed
+        ## seconds after it ended, whose closing level nothing had vouched for yet — redo it.
+        existing = done.get(round(t0))
+        if existing is not None:
+            if existing == 'ok' or (now - t1) > RECHECK_HORIZON_S:
+                skipped += 1
+                continue
+            log.debug(f"Run at {_rfc3339(t0)} is {existing!r}; rechecking now that more "
+                      f"readings have arrived.")
 
         ## No reading from an earlier pumping run may reach the quiet window the refill rate is
         ## measured over. Runs tile the timeline, so the previous run's start is exactly where

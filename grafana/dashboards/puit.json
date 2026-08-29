@@ -876,7 +876,7 @@
       "timeFrom": "7d",
       "targets": [
         {
-          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_volume\")\n  |> filter(fn: (r) => r._field == \"volume_l\" or r._field == \"volume_sigma_l\"\n                    or r._field == \"rate_l_per_h\" or r._field == \"duration_s\")\n  |> keep(columns: [\"_time\", \"_field\", \"_value\", \"quality\"])\n  // group() before pivot: `quality` is a tag, so without it each quality would be its own\n  // table and tail(n: 3) would return three rows PER quality instead of three rows.\n  |> group()\n  |> pivot(rowKey: [\"_time\", \"quality\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"])\n  |> tail(n: 3)",
+          "query": "from(bucket: \"puit\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"pump_volume\")\n  |> filter(fn: (r) => r._field == \"volume_l\" or r._field == \"volume_sigma_l\"\n                    or r._field == \"rate_l_per_h\" or r._field == \"duration_s\"\n                    or r._field == \"quality\")\n  |> keep(columns: [\"_time\", \"_field\", \"_value\"])\n  // group() before pivot so every field lands on one table and tail(n: 3) counts runs.\n  // quality is a FIELD, not a tag, so that a recheck overwrites the run instead of\n  // adding a second series alongside it.\n  |> group()\n  |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"])\n  |> tail(n: 3)",
           "refId": "A"
         }
       ],
