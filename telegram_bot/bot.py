@@ -282,7 +282,13 @@ async def measure(update: Update, context: ContextTypes.DEFAULT_TYPE):
     volume = read_puit.height_to_volume(height)
     text = f"Volume: {volume:.2f} m³ ({volume * 1000:.0f} L)"
     if resampled:
-        text += "\n(médiane de 5 échantillons)"
+        # Derived from the constants rather than written out: this line used to claim "5
+        # échantillons" long after the real figure had moved, because nothing tied the two
+        # together. `resampled` means the extra round was taken — for a moving surface or an
+        # implausible jump — so the reading rests on that many bursts instead of BURSTS.
+        text += (f"\n(surface agitée ou saut inattendu : médiane élargie à "
+                 f"{read_puit.BURSTS + read_puit.EXTRA_BURSTS} salves au lieu de "
+                 f"{read_puit.BURSTS})")
     if not db_ok:
         text += "\n⚠️ Could not write to InfluxDB — value NOT recorded in the database."
     await msg.edit_text(text)
@@ -478,11 +484,15 @@ async def send_graph(update: Update, context: ContextTypes.DEFAULT_TYPE, range_s
     await msg.delete()
 
 def format_sampling(resp):
-    """Render a `sampling` burst as a diagnostic block.
+    """Render one measurement burst, ping by ping, as a diagnostic block.
 
     Works on a failed burst too: the four counts and the effective parameters are on every
     measurement reply, and they are what says whether the sensor is silent, blind, or aimed
     at the wrong thing. The per-ping detail only exists on a successful one.
+
+    Every array is read defensively, which also covers a board still on firmware < 2.3.0: the
+    per-ping arrays arrived on the ordinary reply with that version, and before it this block
+    degrades to the counts rather than breaking.
     """
     lines = []
     if resp.get('status') == 'ok':
@@ -508,7 +518,10 @@ def format_sampling(resp):
     samples_cm = resp.get('samples')
     if isinstance(samples_cm, list):
         lines.append("cm : " + ", ".join('—' if s is None else f"{s:.1f}" for s in samples_cm))
-    pulses = resp.get('pulse_us')
+    # `pulses_us`, plural: `pulse_us` on the same reply is the scalar median, the raw
+    # counterpart of `value`. Separate keys because InfluxDB stores that scalar as a float and
+    # would refuse the field for ever if it ever arrived as an array.
+    pulses = resp.get('pulses_us')
     if isinstance(pulses, list):
         lines.append("µs : " + ", ".join('—' if p is None else f"{p:.0f}" for p in pulses))
     # Present for the T pings too, unlike the two arrays above: a dash in µs beside a number
@@ -526,7 +539,7 @@ def format_sampling(resp):
     return "\n".join(lines)
 
 async def samples(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Relay one `sampling` burst, per ping — admin sensor diagnostics."""
+    """Relay one measurement burst, ping by ping — admin sensor diagnostics."""
     chat_id = str(update.effective_chat.id)
     user = load_users().get(chat_id)
 

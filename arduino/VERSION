@@ -1,5 +1,8 @@
 # Metadata for the committed firmware.bin. Read by flash_firmware.py (version=)
 # and reported on a successful flash. Bump this whenever firmware.bin changes.
-version=2.2.0
-source_commit=7dac494
-built=2026-08-26
+version=2.3.0
+# TODO before pushing: the firmware repo's short SHA, once the 2.3.0 source is
+# committed there. Informational only (nothing parses it), but it is the only
+# link from this binary back to the source that produced it.
+source_commit=PENDING
+built=2026-08-31

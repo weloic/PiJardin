@@ -58,6 +58,11 @@ BOARD = 'puit'
 ## authority is the README of the firmware repo (PiJardin-Arduino_Software); the constants
 ## below only size our own timeouts and guard our own requests. Everything else is
 ## discovered from the board: it echoes the effective value of every parameter it used.
+##
+## Two commands: `read_puit` for a measurement burst and `status` for the board's identity and
+## limits. A burst is parametrised, never modal — n, timeout_us, ack_timeout_us, temp_c,
+## min_cm, max_cm and min_valid are the whole of its variation, and a diagnostic burst differs
+## from a recorded one only in what the caller asks for and what it does with the reply.
 PROTO = 2                       # must match the firmware; bumped only by a breaking change
 LINE_MAX = 192                  # longest request line the board accepts, bytes
 MAX_N = 25                      # most pings per burst; the board clamps anything above it
@@ -86,10 +91,21 @@ FAULT_ALERT_INTERVAL_S = 6 * 3600
 ## SPACED, because that is the part that actually matters. A burst's pings are PING_GAP_S apart
 ## plus their flight time, so the whole burst spans roughly a tenth of a second and its ten
 ## pings all see the SAME phase of whatever the surface is doing. Averaging inside a burst
-## therefore fights electrical noise and quantisation, and does almost nothing about ripple —
-## which is why the board's own median of ten is not the end of the story. Half a second apart
-## puts each burst on a different part of the wave, and the median across them is then a median
-## over the disturbance rather than three views of one instant of it.
+## therefore fights electrical noise and quantisation, and does almost nothing about ripple.
+## Half a second apart puts each burst on a different part of the wave, so the pings of the
+## three together sample the disturbance instead of one instant of it.
+##
+## POOLED, not medianed twice. The reading is one median over every valid ping of every burst
+## — 30 of them — and not a median of the three burst medians. Medianing medians threw 27 of
+## the 30 numbers away before this code ever saw them, and it did so before the spacing above
+## had been exploited: each burst was collapsed against its own phase of the ripple, and only
+## the three survivors met each other. Pooling first keeps all thirty and lets the spacing do
+## what it was for.
+##
+## The one behavioural consequence worth naming: this weights by evidence rather than by burst.
+## A burst that lost nine of its ten pings used to cast a full third of the vote on the
+## strength of one surviving ping; it now contributes that one ping among ~21. Bursts stay
+## equal only while they stay equally successful, which is the intended reading of "precision".
 BURSTS = 3
 BURST_GAP_S = 0.5
 
@@ -701,6 +717,11 @@ def write_service_failure(unit):
 ## everything already recorded. The counts make a sensor degrading over weeks visible as a
 ## graph (n_valid/n) instead of as a surprise the morning it dies.
 ##
+## These now describe the whole measurement rather than one of its bursts (see _aggregate), so
+## the counts are sums and n reads 30 where it used to read 10. The types are untouched, which
+## is what matters to InfluxDB, and n_valid/n is a ratio — the graph worth watching means the
+## same thing across the change, only over three times the evidence.
+##
 ## n_stuck and ack_max_us arrive with fw 2.1.0 and are simply absent on an older board — the
 ## loop below skips whatever is missing, so this stays compatible either way. ack_max_us is
 ## the one to graph next to n_valid/n: it is the module's reaction time, and its upward trend
@@ -712,7 +733,8 @@ MEASUREMENT_FIELDS = (
     ('n_stuck', int), ('ack_max_us', int),
 )
 
-def write_influx_measurement(heigth_median, resampled=False, resp=None):
+def write_influx_measurement(heigth_median, resampled=False, fields=None):
+    """Record one reading. `fields` is _aggregate()'s summary of the bursts behind it."""
     if write_api is None:
         log.warning("No InfluxDB write API; measurement not recorded.")
         return False
@@ -734,7 +756,7 @@ def write_influx_measurement(heigth_median, resampled=False, resp=None):
         .field('lenght_median', heigth_median)
     )
     for name, cast in MEASUREMENT_FIELDS:
-        value = (resp or {}).get(name)
+        value = (fields or {}).get(name)
         if isinstance(value, (int, float)):
             point.field(name, cast(value))
     point.time(when, WritePrecision.S)
@@ -749,9 +771,104 @@ def write_influx_measurement(heigth_median, resampled=False, resp=None):
 
 
 def _spread_cm(responses):
-    """How far apart the burst values are, cm. The surface-movement signal."""
+    """How far apart the burst values are, cm. The surface-movement signal.
+
+    Deliberately over the burst MEDIANS, not over the pooled pings that produce the reading:
+    the question here is whether three views taken half a second apart disagree, which is what
+    a moving surface looks like. Max minus min over thirty raw pings would instead measure
+    per-ping noise, comfortably exceed BURST_SPREAD_CM on a perfectly still well, and so fire
+    EXTRA_BURSTS on every single reading.
+    """
     values = [r['value'] for r in responses]
     return max(values) - min(values) if len(values) > 1 else 0.0
+
+
+def _pooled_pings(responses):
+    """Every valid ping of every burst, as parallel (cm, pulse_us) lists.
+
+    Only the 'V' pings. samples[] also carries the 'R' ones — the firmware keeps their raw
+    numbers because raw truth is never discarded, but excludes them from its statistics, and
+    pooling without this filter would readmit exactly the bracket and blind-zone echoes that
+    the min_cm/max_cm window exists to throw out. ping_status is the firmware's own verdict on
+    each ping, so filtering on it is what keeps our definition of "valid" identical to its.
+
+    Returns None — distinct from a pool that came out empty — when any burst arrived without
+    the per-ping arrays, so the caller can tell an un-upgraded board apart from a sensor that
+    answered without a single valid ping. That is firmware < 2.3.0, realistically the seconds
+    between deploy.sh restarting sensors.service and the flash migration running, and the two
+    want different words in the log: one says flash the board, the other says go and look at
+    the sensor.
+
+    All-or-nothing on the same reasoning: a partial pool would silently compute the reading
+    from whichever bursts happened to be detailed, which is a worse answer than the old one.
+    """
+    cm, pulse_us = [], []
+    for resp in responses:
+        pattern = resp.get('ping_status')
+        samples = resp.get('samples')
+        pulses = resp.get('pulses_us')
+        if not isinstance(pattern, str) or not isinstance(samples, list) \
+                or not isinstance(pulses, list) \
+                or not len(pattern) == len(samples) == len(pulses):
+            return None
+        for status, sample, pulse in zip(pattern, samples, pulses):
+            # A 'V' ping always has both numbers; the None guard is belt-and-braces against a
+            # reply whose arrays and pattern disagree, which would otherwise poison the median.
+            if status == 'V' and sample is not None and pulse is not None:
+                cm.append(float(sample))
+                pulse_us.append(float(pulse))
+    return cm, pulse_us
+
+
+def _aggregate(responses):
+    """Reduce the bursts of one measurement to (height_cm, fields to record).
+
+    The height is the median over every valid ping of every burst — see BURSTS. `fields` is
+    shaped for write_influx_measurement(): the same keys a single burst reply carries, so
+    MEASUREMENT_FIELDS reads it unchanged, but summed or maxed across the bursts instead of
+    taken from one of them.
+
+    pulse_us is the median of the SAME pooled pings, which is what keeps it the raw counterpart
+    of the height rather than a number from somewhere nearby. cm = pulse / divisor is monotonic
+    and the divisor is one value for the whole measurement (temp_c is a parameter, identical on
+    every burst), so the two medians fall at the same place in the same ordering — the argument
+    the firmware makes for its own pair in summarize(). That is what makes a future correction
+    to the µs->cm divisor replayable over everything already recorded.
+    """
+    pooled = _pooled_pings(responses)
+    if pooled and pooled[0]:
+        cm, pulse_us = pooled
+        height = float(median(cm))
+        pulse = float(median(pulse_us))
+    else:
+        # Fall back to the old median of burst medians, with the pulse of whichever burst
+        # landed nearest it. Two quite different reasons get here, so they are named apart:
+        if pooled is None:
+            log.warning(f"No per-ping detail in {len(responses)} burst(s) — falling back to "
+                        f"the median of burst medians. Flash firmware 2.3.0 or later (/flash) "
+                        f"to median over every ping instead.")
+        else:
+            # Arrays present, not one valid ping in any of them. The board's own min_valid
+            # gate should have refused these bursts long before they reached us, so this is a
+            # firmware or a parsing bug rather than a well problem — and the values we are
+            # about to fall back on are the medians of nothing.
+            log.error(f"{len(responses)} burst(s) reported ok with no valid ping between them "
+                      f"— the board's min_valid gate should have refused them. Recording the "
+                      f"reported medians, but this reading is not to be trusted.")
+        height = float(median([r['value'] for r in responses]))
+        nearest = min(responses, key=lambda r: abs(r['value'] - height))
+        pulse = nearest.get('pulse_us')
+
+    fields = {name: sum(r.get(name, 0) for r in responses)
+              for name in ('n', 'n_valid', 'n_timeout', 'n_rejected', 'n_no_response', 'n_stuck')}
+    # The worst reaction time seen anywhere in the measurement: this field is trended to catch a
+    # module going slow, and a max is the only summary that cannot hide the drift being watched.
+    fields['ack_max_us'] = max((r.get('ack_max_us') or 0 for r in responses), default=0)
+    # A parameter, not a measurement — the same on every burst, so any of them will do.
+    fields['temp_c'] = responses[0].get('temp_c')
+    if pulse is not None:
+        fields['pulse_us'] = pulse
+    return height, fields
 
 
 def _extra_bursts(arduino, count):
@@ -782,9 +899,10 @@ def collect_puit_data(arduino, check_alerts=True):
     usable reading — the code says whose problem it is, and it is already logged at the
     level it deserves and alerted on if someone has to go to the well.
 
-    Every reading is the median of BURSTS spaced bursts, and EXTRA_BURSTS more are taken when
-    either the bursts disagree with each other (a moving surface) or the result disagrees with
-    the last stored reading (a level that cannot have moved that far). `resampled` is true when
+    Every reading is the median over every valid ping of BURSTS spaced bursts — thirty of them
+    at the default n — and EXTRA_BURSTS more are taken when either the bursts disagree with
+    each other (a moving surface) or the result disagrees with the last stored reading (a level
+    that cannot have moved that far). `resampled` is true when
     that second round happened, for either reason — it used to mean the jump test alone, and
     now means "this reading needed more than the standard set", which is the thing worth
     knowing about a stored point.
@@ -824,7 +942,7 @@ def collect_puit_data(arduino, check_alerts=True):
     # The rest of the standard set. Tolerant, unlike the first: that one has already told us
     # the sensor is answering, so a later failure costs precision rather than the reading.
     responses += _extra_bursts(arduino, BURSTS - 1)
-    height = float(median([r['value'] for r in responses]))
+    height, fields = _aggregate(responses)
 
     spread = _spread_cm(responses)
     jumped = previous_measure is not None and abs(height - previous_measure) > max_diff_tolerance
@@ -842,16 +960,14 @@ def collect_puit_data(arduino, check_alerts=True):
             log.info(f"Level moved {abs(height - previous_measure):.1f} cm since the last "
                      f"reading (> {max_diff_tolerance} cm), taking {EXTRA_BURSTS} more.")
         responses += _extra_bursts(arduino, EXTRA_BURSTS)
-        height = float(median([r['value'] for r in responses]))
+        height, fields = _aggregate(responses)
         resampled = True
-        log.info(f"Kept {height:.1f} cm as the median of {len(responses)} bursts "
-                 f"(spread {_spread_cm(responses):.1f} cm).")
+        log.info(f"Re-medianed over the widened set; bursts now spread "
+                 f"{_spread_cm(responses):.1f} cm.")
 
-    # Record the raw pulse and counts of the burst that produced the retained value, so
-    # pulse_us and lenght_median stay the same measurement — that is what makes a later
-    # divisor correction replayable over the history.
-    kept = min(responses, key=lambda r: abs(r['value'] - height))
-    db_ok = write_influx_measurement(height, resampled, kept)
+    log.info(f"Recording {height:.1f} cm — median of {fields['n_valid']}/{fields['n']} valid "
+             f"pings over {len(responses)} burst(s).")
+    db_ok = write_influx_measurement(height, resampled, fields)
     save_previous_measure(height)
 
     if check_alerts:
@@ -915,10 +1031,16 @@ def measure_once(lock_timeout=0, check_alerts=True):
 
 
 def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):
-    """Ask the Arduino for one `sampling` burst — per-ping detail, diagnostics only.
+    """Take one burst and return it whole — per-ping detail, for diagnostics.
+
+    The same `read_puit` command the measurement path uses; what makes this a diagnostic is
+    the parameters it exposes and that nothing is aggregated away afterwards. There used to be
+    a second command, `sampling`, whose only difference was printing the per-ping arrays —
+    firmware 2.3.0 puts those on every reply, so there is one command left and `n` /
+    `ack_timeout_us` are the whole of the variation.
 
     Returns the response dict: the same statistics as a measurement plus index-aligned
-    `samples`/`pulse_us`/`ack_us` arrays and `ping_status`, one character per ping. That last
+    `samples`/`pulses_us`/`ack_us` arrays and `ping_status`, one character per ping. That last
     field is the only per-ping way to tell a sensor that answered but saw nothing (T) from one
     that ignored the trigger (N) or never got one (S) — all three are null in `samples`.
     `ack_us` follows a different null rule and separates T from N/S on its own: it holds a
@@ -936,8 +1058,7 @@ def raw_samples_once(lock_timeout=0, n=None, ack_timeout_us=None):
     failing response on `.resp`) if the burst failed, TimeoutError like measure_once.
     """
     def action(arduino):
-        resp = measure(arduino, cmd='sampling', retries=1, n=n,
-                       ack_timeout_us=ack_timeout_us)
+        resp = measure(arduino, retries=1, n=n, ack_timeout_us=ack_timeout_us)
         log_burst_health(resp)
         return resp
 

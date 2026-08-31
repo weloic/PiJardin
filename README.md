@@ -59,16 +59,18 @@ project; the Telegram bot is an add-on and never writes to it):
 - **`height_measure` measurement** — one point per reading, timestamped at the moment it was
   taken (so an on-demand `/mesure` lands where it happened rather than on the 5-min grid), tag
   `resampled`. Field `lenght_median` is the distance in cm the Grafana dashboards read; the
-  rest is health and future repair, all from the same burst: `pulse_us` (the raw echo width,
-  the only thing the board actually measures) and `temp_c` (the air temperature it was
-  converted with) make a later correction to the µs→cm divisor replayable over history, and
-  `n`/`n_valid`/`n_timeout`/`n_rejected`/`n_no_response` say how the burst went. Graphing
-  `n_valid / n` is the best early warning there is: a sensor on its way out trends down for
-  weeks before it fails outright.
+  rest is health and future repair, all describing the same measurement: `pulse_us` (the raw
+  echo width, the only thing the board actually measures) and `temp_c` (the air temperature it
+  was converted with) make a later correction to the µs→cm divisor replayable over history, and
+  `n`/`n_valid`/`n_timeout`/`n_rejected`/`n_no_response` say how the pings went, summed over
+  every burst behind the reading. Graphing `n_valid / n` is the best early warning there is: a
+  sensor on its way out trends down for weeks before it fails outright.
 
-  **Every reading is the median of 3 bursts taken half a second apart**, and 4 more are taken
-  when either the bursts disagree by more than 1 cm or the result has moved more than 5 cm
-  since the last stored reading — `resampled` marks that second round, whichever triggered it.
+  **Every reading is one median over all 30 pings of 3 bursts taken half a second apart**, and
+  4 more bursts are taken when either the bursts disagree by more than 1 cm or the result has
+  moved more than 5 cm since the last stored reading — `resampled` marks that second round,
+  whichever triggered it.
+
   The spacing is the part that matters and is easy to get wrong: a burst's 10 pings are ~3 ms
   apart, so the whole burst spans about a tenth of a second and all ten pings see the *same*
   phase of whatever the surface is doing. More pings per burst therefore fight electrical noise
@@ -76,6 +78,15 @@ project; the Telegram bot is an add-on and never writes to it):
   moving surface. That matters because the cistern can run as a closed loop, whose returning
   flow disturbs the surface without moving the level — so the 5 cm jump test never fires, and a
   rippled surface would otherwise be read once and believed.
+
+  The pings are **pooled, not medianed twice**. Up to firmware 2.2.0 the board returned only
+  its own median per burst and the Pi medianed those three, which discarded 27 of the 30 values
+  before this side ever saw them — and discarded them *within* each burst, against a single
+  phase of the ripple, before the spacing above could do its work. Since 2.3.0 every reply
+  carries its per-ping values, so all 30 meet each other in one median. One consequence worth
+  knowing when reading the data: this weights by evidence rather than by burst, so a burst that
+  lost 9 of its 10 pings no longer casts a full third of the vote on the strength of the one
+  that survived.
 - **`log` measurement** — every `WARNING`+ from the scheduled `sensors.service` data path
   (`read_puit`/`alerts`), written automatically. Tags: `level`, `source`; field: `message`.
 - **`version` measurement** — a marker written by `deploy.sh` on each deploy (`event=deploy`)
@@ -321,8 +332,12 @@ reflash the committed binary. Full workflow and recovery steps: `arduino/README.
 **The Pi and the board share a versioned serial contract** — newline-delimited JSON over the
 board's USB serial port, one object per line each way, `proto = 2`. `sensors/read_puit.py` sends
 `{"id":n,"cmd":"read_puit"}` and matches the reply by its echoed `id`; the board answers
-with the distance plus the four ping counts, or with an explicit error `code` instead of a
-silent `0`. The full contract (commands, parameters, every error code) lives in the
+with the distance, the four ping counts and the per-ping detail behind them, or with an
+explicit error `code` instead of a silent `0`. There is **one measurement command**, varied by
+parameters (`n`, `ack_timeout_us`, `temp_c`, the plausibility window) rather than by mode —
+firmware 2.3.0 merged the separate `sampling` command into it, which is what lets a recorded
+reading be a median over raw pings instead of a median of burst medians. The full contract
+(commands, parameters, every error code) lives in the
 firmware repo's README — [PiJardin-Arduino_Software](https://github.com/weloic/PiJardin-Arduino_Software).
 `PROTO` in `read_puit.py` must match the flashed firmware: every line the board emits carries
 its `proto`, so a mismatch fails the handshake with `proto_mismatch` rather than recording
@@ -341,7 +356,8 @@ and `insufficient_samples` are retried (ripples, an oblique surface); `sensor_fa
 sensor ignores the trigger — power or wiring) and `out_of_range` (it answers but is misaimed
 or obstructed) are **not** retried and notify the admins on Telegram, throttled to once per
 6 h per code since the scheduled run fires every 5 minutes; anything else is a bug in the
-request the Pi sent. Admins can see one burst ping-by-ping with `/echantillons`.
+request the Pi sent. Admins can see one burst ping-by-ping with `/echantillons` — the same
+command a measurement uses, just shown whole instead of aggregated.
 
 **Which board is on which port is never assumed.** `/dev/ttyACM*` numbering is enumeration
 order, not identity, so the device node is resolved at open time from the USB product string
