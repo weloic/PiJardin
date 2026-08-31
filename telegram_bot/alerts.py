@@ -6,10 +6,11 @@ import sys
 import json
 import logging
 import datetime
+import urllib.error
 import urllib.parse
 import urllib.request
 
-from user_store import load_users
+from user_store import load_users, forget_user, rekey_user
 
 ## Repo root on sys.path so the shared `common` package is importable when alerts.py is run
 ## as a script (python alerts.py ...); when imported by read_puit/bot it is already there.
@@ -143,6 +144,42 @@ def check_thresholds(volume_m3):
 # -------------------------------------------------------------------------------------------------
 # TELEGRAM SENDING
 
+## Telegram error descriptions that mean this chat will never accept a message again: the bot was
+## removed, the group was deleted, or the user blocked it. Matched on the description and not on
+## the status code, because a 400 also covers our own mistakes — a text over the 4096-char cap,
+## say — and those must not cost us a recipient.
+DEAD_CHAT_ERRORS = (
+    "chat not found",
+    "bot was kicked",
+    "bot was blocked",
+    "bot is not a member",
+    "user is deactivated",
+    "group chat was deactivated",
+)
+
+def post_message(url, chat_id, text):
+    """Send one message. Returns (ok, description, migrate_to_chat_id).
+
+    The description is Telegram's own wording when it answers with an error, which is the only
+    thing that says whether the failure is worth retrying — the status code alone does not.
+    """
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10) as resp:
+            resp.read()
+        return True, None, None
+    except urllib.error.HTTPError as e:
+        body = {}
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            pass  # Not JSON (a proxy error page, say); fall back to the status line.
+        description = body.get("description") or str(e)
+        return False, description, (body.get("parameters") or {}).get("migrate_to_chat_id")
+    except Exception as e:
+        ## Timeout, DNS, connection reset: transient, and the chat is not to blame.
+        return False, str(e), None
+
 def send_telegram(chat_ids, text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -150,13 +187,29 @@ def send_telegram(chat_ids, text):
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     for chat_id in chat_ids:
-        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10) as resp:
-                resp.read()
+        ok, description, migrate_to = post_message(url, chat_id, text)
+
+        if not ok and migrate_to:
+            ## Upgraded to a supergroup, hence a new id. Follow it and deliver, so the group keeps
+            ## receiving its alerts instead of looking dead.
+            log.warning(f"Chat {chat_id} was upgraded to a supergroup ({migrate_to}); following it.")
+            rekey_user(chat_id, migrate_to)
+            chat_id = migrate_to
+            ok, description, _ = post_message(url, chat_id, text)
+
+        if ok:
             log.info(f"Alert sent to chat {chat_id}.")
-        except Exception as e:
-            log.error(f"Could not send alert to chat {chat_id}: {e}")
+            continue
+
+        if any(dead in description.lower() for dead in DEAD_CHAT_ERRORS):
+            ## Left in the registry, this chat would fail on every alert forever, and the failure
+            ## is only visible in the log — so a threshold alert nobody receives would look sent.
+            log.warning(f"Chat {chat_id} is permanently unreachable ({description}); "
+                        f"removing it from the registry. It can register again with /start.")
+            forget_user(chat_id)
+            continue
+
+        log.error(f"Could not send alert to chat {chat_id}: {description}")
 
 # -------------------------------------------------------------------------------------------------
 # PUMP CYCLE NOTIFICATION

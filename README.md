@@ -111,6 +111,11 @@ Users register themselves by messaging the bot `/start <password>`. The password
 
 Registered chat IDs and roles are stored in `telegram_bot/.telegram_users.json` (gitignored, not committed).
 
+A chat that Telegram reports as permanently unreachable — the bot was kicked, the group was deleted,
+the user blocked it — is removed from that file on the next send, and can register again with
+`/start`. A group upgraded to a supergroup gets a new chat ID from Telegram; its entry is moved to
+the new ID and keeps its role and opt-ins. Transient failures (timeout, 5xx) never drop a recipient.
+
 Alert delivery is independent of role and off by default. Once registered, a user toggles it with `/alertes on` or `/alertes off` (or `/alertes` with no argument to check the current setting).
 
 ## Low-volume alerts
