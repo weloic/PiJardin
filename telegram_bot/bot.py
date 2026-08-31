@@ -10,6 +10,7 @@ import time
 import asyncio
 import logging
 import datetime
+import tempfile
 import subprocess
 
 from telegram import Update
@@ -41,6 +42,16 @@ try:
 except Exception as e:
     graph = None
     log.warning(f"graph module unavailable ({e}); /graphe* commands disabled.")
+
+# export pulls in nothing beyond the standard library and read_puit (already imported above),
+# so this guard is not about a missing dependency like graph's — it is about a broken import
+# never costing the whole bot. On a Pi with no SSH the bot is the only way back in, so one
+# add-on command failing to load must stay one command failing to load.
+try:
+    import export
+except Exception as e:
+    export = None
+    log.warning(f"export module unavailable ({e}); /export disabled.")
 from user_store import load_users, save_users
 from alerts import ALERT_LOW_VOLUME_M3, ALERT_CRITICAL_VOLUME_M3
 
@@ -153,6 +164,36 @@ def build_logs_payload(output, unit_alias, header):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
     return {"kind": "file", "data": output.encode("utf-8"),
             "filename": f"{unit_alias}_{stamp}.log", "caption": header}
+
+## How far back /export reaches by default. The dashboard opens on `now-7d`, so a shorter
+## export leaves « Historique semaine » visibly truncated when it is replayed — which reads as
+## a hole in the data rather than as a narrow request.
+EXPORT_DEFAULT_WINDOW = datetime.timedelta(days=8)
+
+## And the most it will reach. Not a guess at what is useful: the export queries InfluxDB one
+## day at a time, so the window sets the number of round trips, and a fat-fingered `/export
+## 3650d` would put 21 900 queries through influxd on a Pi 3 that is already swapping.
+EXPORT_MAX_WINDOW = datetime.timedelta(days=90)
+
+## Duration suffixes /export accepts. Seconds are deliberately absent — `range()` would be
+## narrower than the 5-minute cadence and always come back empty, which looks like a fault.
+EXPORT_UNITS = {'m': 'minutes', 'h': 'hours', 'd': 'days'}
+
+def parse_export_window(token):
+    """`30m` / `12h` / `8d` as a timedelta, or None if the token is not a duration."""
+    match = re.fullmatch(r"(\d+)([mhd])", token.lower())
+    if not match:
+        return None
+    return datetime.timedelta(**{EXPORT_UNITS[match.group(2)]: int(match.group(1))})
+
+def export_window_label(window):
+    """The window as a short filename-safe label, at its coarsest exact unit."""
+    if window.days and not window.seconds:
+        return f"{window.days}d"
+    hours = window.days * 24 + window.seconds // 3600
+    if hours and not window.seconds % 3600:
+        return f"{hours}h"
+    return f"{window.days * 1440 + window.seconds // 60}m"
 
 # -------------------------------------------------------------------------------------------------
 # STARTUP CHECK
@@ -757,6 +798,101 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=buf, filename=payload["filename"], caption=payload["caption"])
 
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the measurements as gzipped line protocol. Admin-only remote diagnostics.
+
+    The point of it is that the file reloads into any InfluxDB, and `grafana/` in this repo
+    provisions the real dashboard against it — same panel JSON, same Flux, same datasource uid.
+    So this is how those panels get looked at from off the Pi, without reimplementing them and
+    without a picture that could disagree with what the data actually says.
+
+    Admin-only because it is a dump of the whole bucket, not a reading from it.
+    """
+    chat_id = str(update.effective_chat.id)
+    user = load_users().get(chat_id)
+
+    if user is None or user.get("banned") or user.get("role") != "admin":
+        await update.message.reply_text("Admin only.")
+        return
+
+    if export is None:
+        await update.message.reply_text("Export indisponible (voir /logs bot).")
+        return
+
+    usage = "Usage: /export [30m|12h|8d] [nohb]"
+
+    # Order-independent tokens, the same shape as /logs: a duration sets the window, `nohb`
+    # drops the pump heartbeats.
+    window = EXPORT_DEFAULT_WINDOW
+    include_heartbeats = True
+    for arg in context.args:
+        if arg.lower() == "nohb":
+            include_heartbeats = False
+            continue
+        parsed = parse_export_window(arg)
+        if parsed is None:
+            await update.message.reply_text(usage)
+            return
+        window = parsed
+
+    if not window or window > EXPORT_MAX_WINDOW:
+        await update.message.reply_text(
+            f"Fenêtre hors limites (1 minute à {EXPORT_MAX_WINDOW.days} jours).")
+        return
+
+    label = export_window_label(window)
+    msg = await update.message.reply_text(
+        f"Export sur {label} en cours, patience (quelques dizaines de secondes)")
+
+    ## A temporary file, not an in-memory buffer. export.py streams and compresses record by
+    ## record precisely so nothing grows with the window asked for, and collecting the result
+    ## into a BytesIO here would put that straight back — up to the 45 MB cap, on a Pi with
+    ## ~380 MB available. Debian leaves /tmp on disk (systemd's tmp.mount is masked), so this
+    ## really is off the heap, and TemporaryFile unlinks itself on close.
+    with tempfile.TemporaryFile() as sink:
+        try:
+            counts = await asyncio.to_thread(
+                export.build_export, sink, window, include_heartbeats, redact_secrets)
+        except export.ExportTooLarge as e:
+            await msg.edit_text(
+                f"Export trop volumineux ({e}).\nRéduisez la fenêtre, ou ajoutez "
+                "<code>nohb</code> pour retirer les battements de la pompe — ils dominent le "
+                "volume (un par minute, contre une mesure toutes les 5 min).",
+                parse_mode="HTML")
+            return
+        except Exception as e:
+            log.warning(f"/export failed for chat {chat_id}: {e}")
+            await msg.edit_text(f"Export impossible : {e}")
+            return
+
+        total = sum(counts.values())
+        if not total:
+            await msg.edit_text(f"Aucune donnée sur les {label} écoulés.")
+            return
+
+        size = sink.tell()
+        sink.seek(0)
+
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        filename = f"pijardin_{label}_{stamp}.lp.gz"
+        caption = (f"{total} lignes · {size / 1024 / 1024:.1f} Mo\n"
+                   f"{export.format_counts(counts)}")
+        if not include_heartbeats:
+            # Worth saying on the file itself: a week later nothing in it explains why the pump
+            # trace has gaps, and the README is explicit that without the heartbeats "pump off"
+            # and "board dead" are the same picture.
+            caption += "\n⚠️ sans les battements de pompe"
+
+        ## An explicit write timeout, unlike the .txt files /logs sends. Those are a few kB;
+        ## this is megabytes going up a domestic uplink, where python-telegram-bot's default
+        ## (a handful of seconds) expires mid-upload and reports a network error for what is
+        ## really a file doing exactly what it should. Generous rather than tuned: the handler
+        ## is async, so a slow upload costs this command time and no other.
+        await update.message.reply_document(
+            document=sink, filename=filename, caption=caption, write_timeout=600)
+
+    await msg.delete()
+
 ## /help text (HTML). Literal <, >, & are pre-escaped; examples go in <pre> blocks. The admin
 ## section is appended only for admins.
 HELP_GENERAL = (
@@ -795,6 +931,14 @@ HELP_ADMIN = (
     "<b>/boards</b> — quelle carte est branchée sur quel port : chaîne USB attendue, port "
     "résolu, et repli éventuel. N'ouvre jamais le port, donc sans risque pendant une mesure ; "
     "une carte figée apparaît quand même comme présente\n"
+    "<b>/export</b> [30m|12h|8d] [nohb] — les mesures en line protocol gzippé, à recharger "
+    "dans un InfluxDB local pour rejouer le vrai dashboard Grafana hors du Pi. Par défaut "
+    "8 jours (le dashboard s'ouvre sur 7). <b>nohb</b> retire les battements de la pompe, qui "
+    "dominent le volume du fichier — au prix de ne plus distinguer « pompe arrêtée » de "
+    "« carte muette »\n"
+    "<pre>/export            (8 derniers jours)\n"
+    "/export 30d        (30 jours)\n"
+    "/export 12h nohb   (12 h, sans les battements)</pre>"
     "<b>/logs</b> [bot|sensors|deploy|pump] [N | 2h|30m|3d] [since &lt;t&gt;] [until &lt;t&gt;] — "
     "journaux d'un service ; compact (≤ 15 lignes) en message, sinon en fichier .txt\n"
     "<pre>/logs                       (15 dernières lignes du bot)\n"
@@ -898,6 +1042,7 @@ application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
+application.add_handler(CommandHandler("export", export_command))
 application.add_handler(CommandHandler("echantillons", samples))
 application.add_handler(CommandHandler("flash", flash))
 application.add_handler(CommandHandler("boards", board_status))
