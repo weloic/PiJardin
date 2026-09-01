@@ -99,6 +99,35 @@ project; the Telegram bot is an add-on and never writes to it):
   hook (`pijardin-onfailure@.service`) writes a `CRITICAL` `log` point (`source=<unit>`), so a
   dead service still leaves a trace even though it can't report on itself.
 
+## Replaying the dashboard off the Pi
+
+Grafana listens on the Pi's own `localhost` and there is no route to it, so the panels cannot be
+opened from anywhere else. `devstack/` answers that by moving the **data** instead of a picture
+of them: `/export` sends the measurements as gzipped line protocol over Telegram, a local
+InfluxDB ingests them, and a local Grafana mounts the provisioning files in `grafana/`
+unmodified. Same panel JSON, same Flux, same datasource uid — so it is the real dashboard, not a
+reimplementation that could quietly disagree with the Pi.
+
+```bash
+cd devstack && ./up.sh                     # InfluxDB + Grafana on localhost
+#   on Telegram (admin):  /export 8d
+./import.sh ~/Downloads/pijardin_8d_*.lp.gz
+```
+
+Full detail, including how the local provisioning is derived from the production one and the
+timezone caveat, in [devstack/README.md](devstack/README.md).
+
+**The Pi runs Grafana 12.0.2 and InfluxDB 2.7.11** (Raspberry Pi 3 Model B, arm64, Debian 12;
+measured by `deploy/migrations/0007_probe_environment.sh`). Both are apt packages with unpinned
+versions, so this is recorded here rather than being discoverable from the repo — and
+`devstack/docker-compose.yml` pins its images to these exact tags, because Grafana migrates a
+dashboard's `schemaVersion` on load when the major differs.
+
+That 906 MB of RAM, ~240 MB of it already in swap at rest, is also why two tempting things are
+not done: `grafana-image-renderer` (headless Chromium peaks around 300 MB, and the OOM killer
+would most likely pick `influxd`, the largest process on the box) and moving the datastore into
+Docker (`dockerd` is 100–200 MB resident). Both would need a Pi 4 or 5.
+
 ## Telegram bot deploy
 Once .env is set, run following to deploy:
 ```
