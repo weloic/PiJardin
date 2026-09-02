@@ -13,12 +13,20 @@ git fetch origin main --quiet
 git reset --hard origin/main
 NEW=$(git rev-parse HEAD)
 
+# Whether this tick actually brought new code. Deliberately a flag rather than an early
+# exit: the migration runner near the bottom must get a look in either way. On a fresh Pi
+# `git clone` already lands on origin/main's tip, so the first deploy tick finds OLD == NEW
+# — and an early exit here would skip every pending migration, including the firmware flash
+# that 0003 says measurements cannot work without, until some unrelated later commit moved
+# HEAD. The path-diff checks below need no extra guard: `git diff` between two identical
+# commits is empty, so each one is already a no-op when nothing changed.
 if [ "$OLD" = "$NEW" ]; then
-    echo "No changes."
-    exit 0
+    CHANGED=0
+    echo "No new commits; checking for pending migrations."
+else
+    CHANGED=1
+    echo "Updating $OLD -> $NEW"
 fi
-
-echo "Updating $OLD -> $NEW"
 
 # Update Python deps if they changed. Non-fatal: a failed install must not abort
 # the deploy before the service restarts below, or the bot keeps running stale
@@ -124,7 +132,9 @@ fi
 # bot, which just restarted) via alerts.py's direct API call. The token is a shell
 # var from .env, not exported, so pass it explicitly to the subprocess. Non-fatal:
 # the deploy has already succeeded, so a notification failure must not abort it.
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+# Gated on CHANGED: this runner now also fires on ticks that brought nothing new
+# (so migrations get a look in), and "deployed" every 15 minutes is just noise.
+if [ "$CHANGED" -eq 1 ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
     git log --oneline "$OLD..$NEW" \
         | TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
           "$VENV_DIR/bin/python" "$REPO_DIR/telegram_bot/alerts.py" deploy "$OLD" "$NEW" \
@@ -134,10 +144,14 @@ fi
 # Record a Point('version') marker in InfluxDB (Pi commit, Arduino firmware, Grafana config)
 # so a version change can be overlaid as a Grafana annotation. The InfluxDB vars are shell
 # vars from .env (sourced above, not exported), so pass them explicitly to the subprocess.
-# Non-fatal: the deploy has already succeeded.
-INFLUX_URL="${INFLUX_URL:-}" INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-}" \
-INFLUX_ORG="${INFLUX_ORG:-}" INFLUX_BUCKET="${INFLUX_BUCKET:-}" \
-    "$VENV_DIR/bin/python" "$REPO_DIR/sensors/read_puit.py" record-version deploy \
-    || echo "WARNING: could not record version marker."
+# Non-fatal: the deploy has already succeeded. Gated on CHANGED for the same reason as the
+# notification above — the marker exists to annotate a version *change*, and recording an
+# identical point every 15 minutes would bury the real transitions it is meant to mark.
+if [ "$CHANGED" -eq 1 ]; then
+    INFLUX_URL="${INFLUX_URL:-}" INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-}" \
+    INFLUX_ORG="${INFLUX_ORG:-}" INFLUX_BUCKET="${INFLUX_BUCKET:-}" \
+        "$VENV_DIR/bin/python" "$REPO_DIR/sensors/read_puit.py" record-version deploy \
+        || echo "WARNING: could not record version marker."
+fi
 
 echo "Deploy done."
