@@ -72,18 +72,46 @@ def admin_recipients():
 # ALERT STATE
 
 def load_alert_state():
+    """The per-threshold alert state, or {} when there is none to read.
+
+    A missing file is the ordinary first-run case and stays silent. Anything else — truncated
+    JSON, bad permissions — is logged, because losing this state is not harmless: `was_below`
+    falls back to False, so a threshold already alerted on re-fires as a fresh crossing and a
+    pending recovery message is never sent. journald is the only place a remote diagnosis can
+    start from on this Pi, so that must not happen without a line explaining it.
+    """
     try:
-        with open(ALERT_STATE_FILE, 'r') as f:
+        with open(ALERT_STATE_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return {}          # First run, or state deliberately cleared. Nothing to say.
+    except Exception as e:
+        log.warning(f"Could not load {ALERT_STATE_FILE} ({e}); alert state reset — expect one "
+                    f"repeated threshold alert, or a missed recovery message.")
         return {}
 
 def save_alert_state(state):
+    """Write the alert state, atomically.
+
+    Same reasoning as user_store.save_users, and the same hazard: the file is small and always
+    rewritten whole, so a crash or a power cut partway through a plain write leaves truncated
+    JSON that the next load_alert_state has to discard. Writing a temp file and renaming it
+    means a reader sees either the old state or the new one, never half of one; the Pi runs off
+    an SD card, and the fsync is what extends that guarantee from a crash to a power cut.
+    """
+    tmp = f"{ALERT_STATE_FILE}.{os.getpid()}.tmp"   # pid-suffixed: two writers cannot share it
     try:
-        with open(ALERT_STATE_FILE, 'w') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ALERT_STATE_FILE)
     except Exception as e:
         log.warning(f"Could not save {ALERT_STATE_FILE} ({e}).")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # Never written, or already renamed; nothing to clean up.
 
 # -------------------------------------------------------------------------------------------------
 # THRESHOLD LOGIC
