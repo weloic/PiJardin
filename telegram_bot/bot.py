@@ -886,8 +886,11 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ## An explicit write timeout, unlike the .txt files /logs sends. Those are a few kB;
         ## this is megabytes going up a domestic uplink, where python-telegram-bot's default
         ## (a handful of seconds) expires mid-upload and reports a network error for what is
-        ## really a file doing exactly what it should. Generous rather than tuned: the handler
-        ## is async, so a slow upload costs this command time and no other.
+        ## really a file doing exactly what it should. Generous rather than tuned: this upload
+        ## costs this command time and no other — but only because the handler is registered
+        ## with block=False. Being `async` is not on its own enough: the Application defaults
+        ## to concurrent_updates=False and otherwise awaits one whole handler, `to_thread`
+        ## calls included, before pulling the next update. See the handler registrations.
         await update.message.reply_document(
             document=sink, filename=filename, caption=caption, write_timeout=600)
 
@@ -1032,6 +1035,18 @@ async def on_error(update, context):
 # -------------------------------------------------------------------------------------------------
 # BOT
 
+## concurrent_updates is left at its default (False), so updates are dispatched one at a
+## time: a handler is awaited to completion — every `asyncio.to_thread` inside it included —
+## before the next update is picked up. That is the safe default here and deliberately kept,
+## because the user registry is read-modify-write (load_users() ... save_users()) with no
+## lock, so dispatching everything concurrently would let two handlers race and silently
+## lose a registration.
+##
+## The two commands that genuinely run for minutes are opted out individually instead, with
+## block=False: /flash shells out to bossac for up to 300 s and /export uploads megabytes
+## with a 600 s write timeout, and while either held the dispatcher nobody else's /mesure
+## would even begin. Both are admin-only and both only ever *read* the registry, so running
+## them off the main dispatch path costs none of the safety above.
 application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("alertes", alerts))
@@ -1042,9 +1057,9 @@ application.add_handler(CommandHandler("graphe24h", graphe24h))
 application.add_handler(CommandHandler("graphe3j", graphe3j))
 application.add_handler(CommandHandler("graphe7j", graphe7j))
 application.add_handler(CommandHandler("logs", logs))
-application.add_handler(CommandHandler("export", export_command))
+application.add_handler(CommandHandler("export", export_command, block=False))
 application.add_handler(CommandHandler("echantillons", samples))
-application.add_handler(CommandHandler("flash", flash))
+application.add_handler(CommandHandler("flash", flash, block=False))
 application.add_handler(CommandHandler("boards", board_status))
 application.add_handler(CommandHandler("help", help_command))
 application.add_error_handler(on_error)
